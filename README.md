@@ -1,8 +1,37 @@
-# minilab
+# minilab V600
 
 <p align="center">
   <img src="docs/icon.svg" alt="minilab's icon: an amber film strip on a dark tile" width="96">
 </p>
+
+This fork of [minilab](https://github.com/vdmkenny/minilab) is adapted primarily for the
+**Epson Perfection V600 Photo on Linux**, with the local setup used on NixOS. It keeps the
+original scanning, developing and export workflow, with the additions below. The V600-specific
+changes have not been validated on other scanners or platforms.
+
+## Changes in this version
+
+- **Separate X and Y resolutions:** native resolution menus for SANE drivers that expose both
+  axes. The V600's epkowa driver can offer up to 6400 dpi in X and 9600 dpi in Y. Unequal-axis
+  scans keep the original native TIFF alongside a square-pixel working image. Accepted driver
+  settings alone do not confirm image quality at every resolution.
+- **V600 infrared dust removal:** a separate Linux helper captures RGB and infrared data using
+  Epson Scan 2's command library. The roll keeps the original scan, the IR image and a separate
+  correction that can be switched off in Develop. This uses minilab's own correction, not Epson's
+  Digital ICE. IR capture supports 800, 1600 and 3200 dpi; hardware validation so far was at
+  800 dpi. See [driver setup and limitations](docs/infrared.md).
+- **Saved roll details:** Camera, Lens and Copyright fields accept new values or selections
+  from earlier entries. A manager adds and removes suggestions without changing existing roll
+  metadata. See [saved entries](docs/saved-roll-details.md).
+- **Light appearance:** a persistent Light / Dark selector, with neutral grey surfaces and
+  pastel green main buttons in Light mode. See [appearance](docs/appearance.md).
+
+The V600 setup needs working SANE/epkowa drivers. Infrared capture additionally needs Epson's
+interpreter, firmware and command library; those proprietary files are not included here.
+Build this repository to get these changes. The original project's website and downloads
+describe upstream minilab and do not include this fork's additions.
+
+## About minilab
 
 **minilab** is a cross-platform app for scanning, developing and exporting film, a roll at a
 time. Whether you scan on a flatbed, photograph your negatives with a camera, or already have
@@ -47,8 +76,13 @@ Written in **Zig 0.17** with a **Dear ImGui** interface. For how it works inside
 
 ## Installation
 
-Download the archive for your platform from [the website](https://vdmkenny.github.io/minilab/#download)
-or the [latest release](../../releases/latest). There are builds for Windows, macOS and Linux, on
+For this V600 version, follow [Building it yourself](#building-it-yourself) and the
+[infrared driver setup](docs/infrared.md#driver-setup).
+
+For upstream minilab, download the archive for your platform from
+[the website](https://vdmkenny.github.io/minilab/#download) or the
+[upstream releases](https://github.com/vdmkenny/minilab/releases/latest).
+There are builds for Windows, macOS and Linux, on
 x86-64 and Arm, with a file of checksums to check your download against.
 
 ### macOS

@@ -29,6 +29,8 @@ permissions:
 
 jobs:
   release-please:
+    # The V600 fork uses direct commits without automatic release pull requests.
+    if: github.repository == 'vdmkenny/minilab'
     runs-on: ubuntu-latest
     outputs:
       created: ${{ steps.release.outputs.release_created }}
@@ -43,7 +45,7 @@ jobs:
 
   build:
     needs: release-please
-    if: needs.release-please.outputs.created == 'true' || github.event_name == 'workflow_dispatch'
+    if: ${{ !cancelled() && (needs.release-please.outputs.created == 'true' || github.event_name == 'workflow_dispatch') }}
     strategy:
       fail-fast: false
       matrix:

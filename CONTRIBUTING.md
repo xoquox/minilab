@@ -88,13 +88,13 @@ and Windows, in ReleaseFast as well, and checks the formatting and the files onc
 
 ## Commits and pull requests
 
-- Branch off `main` (`feat/stock-balance`, `fix/...`, `docs/...`) and open a pull request. `main`
-  only changes through squash-merged pull requests.
-- Give the pull request a [Conventional Commits](https://www.conventionalcommits.org) title, like
-  `feat: Stock balance from a calibrated scanner`. Keep the description short, and end it with
-  `Closes #N` for each issue it fixes.
+- This V600 fork uses direct commits on `main`. Do not open pull requests within the fork
+  automatically. Contributions to the upstream project need an explicit request from the user.
+- Use [Conventional Commits](https://www.conventionalcommits.org) titles, like
+  `feat: Stock balance from a calibrated scanner`. If a pull request is requested, keep its
+  description short and end it with `Closes #N` for each issue it fixes.
 - If you leave a gap, file an issue for it and link the issue from the code where the gap is.
-- Releases are handled by [release-please](https://github.com/googleapis/release-please) (see
+- Upstream releases are handled by [release-please](https://github.com/googleapis/release-please) (see
   [`release.yml`](.github/workflows/release.yml) and
   [`release-please-config.json`](release-please-config.json)). It keeps a release pull request
   open with the next version number and its changelog. Merging that pull request tags the version

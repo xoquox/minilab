@@ -14,9 +14,9 @@ how the maintainer likes to work with an agent.
   the maintainer's screen. Point it at a copy of their library, so nothing they're using changes.
 - **Scanners.** Don't scan or move a scanner unless the maintainer asks. Scanning on their hardware
   is their call.
-- **Pull requests.** Push the feature branch and open the pull request when the change is ready.
-  The maintainer merges it. Wait for one pull request to be merged before starting the next
-  feature.
+- **Commits.** This V600 fork is maintained with direct commits on `main`. Commit and push
+  completed changes when requested. Do not open pull requests within this fork automatically.
+  Open a pull request to the upstream project only when the user asks for one.
 - **Attribution.** Commits and pull requests carry the maintainer's git identity only. Leave out
   trailers like `Co-Authored-By` and "Generated with" footers.
 - **Gaps.** File an issue for each gap you leave, and mention the issues in your reply.
