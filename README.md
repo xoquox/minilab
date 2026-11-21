@@ -30,6 +30,8 @@ Written in **Zig 0.17** with a **Dear ImGui** interface. For how it works inside
   neutral.
 - **Dust removal:** finds dust on a scan and fills it in with the film's own grain, with limits
   that keep small lights in the picture.
+  The Epson V600 on Linux can also use a [separate infrared scan](docs/infrared.md), keeping the
+  original and a correction you can turn off in Develop.
 - **Film looks:** Frontier lab emulation, 85 film looks from three free collections, and your own
   `.cube` LUTs (3D or 1D).
 - **Fitted looks:** a look that matches your lab, made from a few frames scanned by both.

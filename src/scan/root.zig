@@ -26,6 +26,7 @@ const builtin = @import("builtin");
 const image = @import("../core/image.zig");
 
 pub const sane = @import("sane.zig");
+pub const sane_ir = @import("epson_ir.zig");
 pub const twain = @import("twain.zig");
 
 /// The scanner libraries we support.
@@ -249,6 +250,8 @@ pub const Capabilities = struct {
     /// Without a profile, the options raw setup reads (`rawSetup`). Empty with a profile, and on
     /// TWAIN, which doesn't list its options.
     options: ?Owned(OptionInfo) = null,
+    /// Separate RGB and infrared capture through the optional Epson helper.
+    infrared: bool = false,
 
     pub fn deinit(capabilities: *Capabilities, gpa: std.mem.Allocator) void {
         gpa.free(capabilities.resolutions);
@@ -287,6 +290,7 @@ pub const Request = struct {
     dpi_y: ?u32 = null,
     /// 16 bits per channel if the scanner has them, otherwise 8.
     deep: bool = true,
+    infrared: bool = false,
     /// What to scan, or null for the source's whole area.
     area: ?Area = null,
     /// The scanner settings' changes to raw setup. They're borrowed, so they have to last until
@@ -305,8 +309,12 @@ pub const Image = struct {
     /// The area the scanner used. It may have rounded the area we asked for.
     area: Area,
 
+    /// A separate, registered transmission plane. It has the colour scan's dimensions.
+    infrared: ?image.Gray = null,
+
     pub fn deinit(picture: *Image, gpa: std.mem.Allocator) void {
         picture.scan.deinit(gpa);
+        if (picture.infrared) |*ir| ir.deinit(gpa);
         picture.* = undefined;
     }
 };
