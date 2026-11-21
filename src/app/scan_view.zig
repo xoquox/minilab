@@ -493,6 +493,7 @@ pub const State = struct {
     /// How detected frames fit their pictures.
     fit: frames.Fit = .format,
     dpi: u32 = default_dpi,
+    dpi_y: ?u32 = null,
     margin_mm: f32 = 1.0,
     margin_text: [16:0]u8 = @splat(0),
     editing_margin: bool = false,
@@ -628,6 +629,7 @@ fn handleEvent(state: *State, ctx: context.Context, worker: *Worker, event: *sca
             state.device = opened.device;
             state.problem = null;
             state.dpi = chooseDpi(opened.capabilities, state.dpi);
+            state.dpi_y = null;
             sendRaw(state, ctx);
             return;
         },
@@ -639,7 +641,7 @@ fn handleEvent(state: *State, ctx: context.Context, worker: *Worker, event: *sca
             state.capabilities = reopened.capabilities;
             state.device = reopened.device;
             state.problem = null;
-            state.dpi = chooseDpi(reopened.capabilities, state.dpi);
+            if (state.dpi_y == null) state.dpi = chooseDpi(reopened.capabilities, state.dpi);
             return;
         },
         .failed => |failed| {
@@ -724,6 +726,14 @@ fn addToRoll(state: *State, ctx: context.Context, done: scan_worker.Scanned) !us
     const r = &ctx.library.rolls.items[index];
     const frame = try r.addScanAt(ctx.gpa, ctx.io, done.ppm, done.dpi);
     const saved = &r.frames.items[frame];
+    if (done.native_tiff) |bytes| {
+        const name = try std.fmt.allocPrint(r.arena.allocator(), "{s}.native.tiff", .{saved.scan.?});
+        const native_path = try std.fs.path.join(ctx.gpa, &.{ r.path, minilab.roll.scans_dir, name });
+        defer ctx.gpa.free(native_path);
+        try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = native_path, .data = bytes });
+        saved.native_scan = name;
+        saved.capture_dpi = done.capture_dpi;
+    }
     saved.crop = done.crop;
     saved.quarter_turns = state.queue_turns;
     try r.saveFrame(ctx.io, frame);
@@ -970,10 +980,35 @@ fn drawResolution(state: *State, panel: ScannerPanel, top: f32) f32 {
         for (labels_[0..resolutions.len], resolutions) |*label, r| label.* = gui.print("{d} dpi", .{r});
         const chosen = std.mem.indexOfScalar(u32, resolutions, state.dpi) orelse resolutions.len;
         c.ImGui_BeginDisabled(state.scanning);
-        if (menu(panel, y, "resolution", labels_[0..resolutions.len], chosen)) |picked| state.dpi = resolutions[picked];
+        if (menu(panel, y, "resolution", labels_[0..resolutions.len], chosen)) |picked| {
+            state.dpi = resolutions[picked];
+            state.dpi_y = null;
+        }
         c.ImGui_EndDisabled();
         y += gui.px(device_height + group_gap);
     }
+    if (state.capabilities) |caps| if (caps.axis_resolutions) |axes| {
+        y += gui.lineAt(panel.list, panel.x, y, theme.text_secondary, "Native X / Y resolution") + gui.px(group_gap);
+        for (axes, 0..) |values, axis| {
+            const listed = values[values.len -| max_resolutions..];
+            if (listed.len == 0) continue;
+            var names: [max_resolutions][]const u8 = undefined;
+            for (names[0..listed.len], listed) |*label, value| label.* = gui.print("{s}: {d} dpi", .{ if (axis == 0) "X" else "Y", value });
+            const current = if (axis == 0) state.dpi else state.dpi_y orelse state.dpi;
+            const chosen = std.mem.indexOfScalar(u32, listed, current) orelse listed.len;
+            c.ImGui_BeginDisabled(state.scanning);
+            if (menu(panel, y, if (axis == 0) "resolution-x" else "resolution-y", names[0..listed.len], chosen)) |picked| {
+                if (state.dpi_y == null) state.dpi_y = state.dpi;
+                if (axis == 0) state.dpi = listed[picked] else state.dpi_y = listed[picked];
+            }
+            c.ImGui_EndDisabled();
+            y += gui.px(device_height + group_gap);
+        }
+    };
+    if (state.dpi_y) |vertical| if (vertical != state.dpi) {
+        const note = gui.print("Native TIFF kept; square-pixel working copy at {d} dpi", .{@max(state.dpi, vertical)});
+        y += gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.text_tertiary, note) + gui.px(group_gap);
+    };
     return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.text_tertiary, sizeNote(state, panel.ctx, panel.roll_index)) + gui.px(scanner_gap);
 }
 
@@ -1327,7 +1362,7 @@ fn sizeNote(state: *const State, ctx: context.Context, roll_index: ?usize) []con
     };
     along_mm += 2 * state.margin_mm;
     const width: u64 = @intFromFloat(@round(across_mm * dpi / mm_per_inch));
-    const height: u64 = @intFromFloat(@round(along_mm * dpi / mm_per_inch));
+    const height: u64 = @intFromFloat(@round(along_mm * @as(f32, @floatFromInt(state.dpi_y orelse state.dpi)) / mm_per_inch));
     const deep = if (state.capabilities) |caps| caps.deep else true;
     const megabytes = labels.megabytes(width * height * @as(u64, if (deep) 6 else 3));
     const about: []const u8 = if (estimate) "About " else "";
@@ -2239,7 +2274,7 @@ fn startScan(state: *State, ctx: context.Context, roll_index: ?usize) void {
         area = area.clip(caps.area) orelse caps.area;
         job.* = .{
             .index = i,
-            .request = .{ .source = caps.source, .film = scanner_film, .dpi = state.dpi, .deep = caps.deep, .area = area },
+            .request = .{ .source = caps.source, .film = scanner_film, .dpi = state.dpi, .dpi_y = state.dpi_y, .deep = caps.deep, .area = area },
             .crop = crop,
             .refine = if (box.hand) null else .{ .format = info.format.format(), .kind = state.film.detectKind(), .axis = preview.axis, .holder = state.holder(), .fit = state.fit, .inset = box.inset / 100 },
         };

@@ -236,6 +236,8 @@ pub const Capabilities = struct {
     source: Source,
     /// Its resolutions in pixels per inch, from low to high.
     resolutions: []u32,
+    /// Exact per-axis resolutions, when the backend exposes both controls.
+    axis_resolutions: ?[2][]u32 = null,
     /// The largest area the source can scan.
     area: Area,
     /// Whether it delivers 16 bits per channel.
@@ -250,6 +252,7 @@ pub const Capabilities = struct {
 
     pub fn deinit(capabilities: *Capabilities, gpa: std.mem.Allocator) void {
         gpa.free(capabilities.resolutions);
+        if (capabilities.axis_resolutions) |axes| for (axes) |values| gpa.free(values);
         if (capabilities.options) |*o| o.deinit();
         capabilities.* = undefined;
     }
@@ -280,6 +283,8 @@ pub const Request = struct {
     source: Source,
     film: Film = .negative,
     dpi: u32,
+    /// A separate carriage resolution; null requests square pixels.
+    dpi_y: ?u32 = null,
     /// 16 bits per channel if the scanner has them, otherwise 8.
     deep: bool = true,
     /// What to scan, or null for the source's whole area.

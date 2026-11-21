@@ -112,7 +112,10 @@ pub const Event = union(enum) {
                 r.capabilities.deinit(gpa);
             },
             .preview => |*p| p.scan.deinit(gpa),
-            .frame_done => |d| gpa.free(d.ppm),
+            .frame_done => |d| {
+                gpa.free(d.ppm);
+                if (d.native_tiff) |bytes| gpa.free(bytes);
+            },
             else => {},
         }
         event.* = undefined;
@@ -134,6 +137,8 @@ pub const Scanned = struct {
     /// The scan as a 16-bit binary PPM.
     ppm: []u8,
     dpi: f32,
+    native_tiff: ?[]u8 = null,
+    capture_dpi: ?[2]f32 = null,
     /// The frame within the scan.
     crop: image.Area,
     /// Whether the crop was found again on this scan, rather than carried over from the preview.
@@ -457,7 +462,18 @@ fn sameDevice(devices: []const scan.Device, old: scan.Device) ?usize {
 
 /// Turns a frame's scan into what the roll keeps: its PPM bytes and the crop. If the frame was
 /// detected rather than placed by hand, the crop is found again on this scan.
-fn finish(gpa: std.mem.Allocator, job: FrameJob, picture: scan.Image) !Scanned {
+fn finish(gpa: std.mem.Allocator, job: FrameJob, captured: scan.Image) !Scanned {
+    var picture = captured;
+    var working: ?image.Scan = null;
+    defer if (working) |*s| s.deinit(gpa);
+    var native: ?[]u8 = null;
+    errdefer if (native) |bytes| gpa.free(bytes);
+    if (captured.dpi[0] != captured.dpi[1]) {
+        native = try minilab.roll.encodeRawAxes(gpa, captured.scan, captured.dpi[0], captured.dpi[1]);
+        working = try image.squarePixels(gpa, captured.scan, captured.dpi);
+        picture.scan = working.?;
+        picture.dpi = @splat(@max(captured.dpi[0], captured.dpi[1]));
+    }
     const whole = picture.scan;
     const px_per_mm = [2]f32{ picture.dpi[0] / minilab.formats.mm_per_inch, picture.dpi[1] / minilab.formats.mm_per_inch };
     // Where the preview says the crop is, in this scan's pixels.
@@ -473,6 +489,8 @@ fn finish(gpa: std.mem.Allocator, job: FrameJob, picture: scan.Image) !Scanned {
     return .{
         .index = job.index,
         .ppm = try minilab.pnm.write(gpa, u16, whole),
+        .native_tiff = native,
+        .capture_dpi = if (native != null) captured.dpi else null,
         .dpi = picture.dpi[0],
         .crop = crop,
         .refined = refined,
@@ -698,3 +716,27 @@ test "a scanner switched off and on is found again, under a new name if it has o
 }
 
 const formats_for_test = minilab.formats.Standard.@"135_full_frame";
+
+test "rectangular capture is archived natively and developed with square pixels" {
+    const gpa = std.testing.allocator;
+    var original = try image.Scan.init(gpa, 2, 3);
+    defer original.deinit(gpa);
+    for (original.pixels) |*pixel| pixel.* = .{ 1000, 30000, 60000 };
+    const area: scan.Area = .{ .x = 0, .y = 0, .width = 25.4 * 2 / 6400.0, .height = 25.4 * 3 / 9600.0 };
+    const job: FrameJob = .{ .index = 0, .request = .{ .source = .transparency, .dpi = 6400, .dpi_y = 9600 }, .crop = area, .refine = null };
+    const captured: scan.Image = .{ .scan = original, .depth = .sixteen, .dpi = .{ 6400, 9600 }, .area = area };
+    var event: Event = .{ .frame_done = try finish(gpa, job, captured) };
+    defer event.deinit(gpa);
+    const done = event.frame_done;
+    try std.testing.expectEqual(@as(f32, 9600), done.dpi);
+    try std.testing.expectEqual([2]f32{ 6400, 9600 }, done.capture_dpi.?);
+    var native = try minilab.codecs.tiff.read(gpa, done.native_tiff.?);
+    defer native.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), native.scan.width);
+    try std.testing.expectEqual(@as(usize, 3), native.scan.height);
+    try std.testing.expectEqualSlices([3]u16, original.pixels, native.scan.pixels);
+    var working = try minilab.pnm.read(gpa, done.ppm);
+    defer working.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), working.width);
+    try std.testing.expectEqual(@as(usize, 3), working.height);
+}

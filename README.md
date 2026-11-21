@@ -199,6 +199,30 @@ film type on positive. The box under the scanner's name on the Scan screen says 
 If it got something wrong for your scanner, open **Scanner settings** and pick another value for
 any of them. Your changes are saved per scanner, and Reset puts the scanner back on Auto.
 
+### Separate X and Y resolutions
+
+On SANE scanners with separate resolution controls, Scan also shows native X and Y menus.
+For an Epson V600 with the epkowa driver, these can reach 6400 and 9600 dpi respectively.
+Only resolutions the driver accepts without rounding or dropping the bit depth are listed.
+The ordinary resolution menu still requests the same resolution in both directions.
+
+When X and Y differ, the roll keeps two files in `scans/`: the untouched native pixel grid
+in a `.native.tiff`, with separate TIFF resolution tags, and a square-pixel working scan.
+The working scan interpolates only the lower-density axis to the higher density. It does
+not add optical detail, but keeps the native detail from both axes while maintaining the
+correct proportions in frame detection, Develop and exports. The frame's JSON records
+`native_scan` and `capture_dpi`. A square-pixel capture keeps the existing single-file layout.
+
+The command line can save a native TIFF directly:
+
+```sh
+minilab scan frame.tiff --dpi 6400 --dpi-y 9600
+```
+
+Different X and Y resolutions require a TIFF destination because PPM cannot record their
+pixel aspect ratio. A setting accepted by a driver still needs a scan on that hardware to
+confirm the resulting image. Scanner options alone do not start a scan.
+
 ## Licence
 
 minilab is under the Mozilla Public License 2.0 (see `LICENSE`). The libraries it builds keep

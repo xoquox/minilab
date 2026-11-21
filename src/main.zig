@@ -37,7 +37,7 @@ const usage =
     \\                                   develop scans from one 35mm roll together, with one film
     \\                                   base for all of them
     \\  minilab scan --list              list the scanners
-    \\  minilab scan <out.ppm> [--device <id or model>] [--dpi <n>] [--area x,y,w,h]
+    \\  minilab scan <out.ppm> [--device <id or model>] [--dpi <n>] [--dpi-y <n>] [--area x,y,w,h]
     \\      [--flatbed] [--film positive|negative]
     \\                                   make one scan of film, at 300 dpi unless you give
     \\                                   --dpi. --area is in mm from the scanner's origin.
@@ -224,6 +224,7 @@ fn scanCommand(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !
     var output: ?[]const u8 = null;
     var wanted: ?[]const u8 = null;
     var dpi: u32 = default_scan_dpi;
+    var dpi_y: ?u32 = null;
     var area: ?scan.Area = null;
     var film: scan.Film = .positive;
     var flatbed = false;
@@ -237,6 +238,8 @@ fn scanCommand(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !
             wanted = try each.value();
         } else if (eql(arg, "--dpi")) {
             dpi = std.fmt.parseInt(u32, try each.value(), 10) catch return error.Usage;
+        } else if (eql(arg, "--dpi-y")) {
+            dpi_y = std.fmt.parseInt(u32, try each.value(), 10) catch return error.Usage;
         } else if (eql(arg, "--film")) {
             film = std.meta.stringToEnum(scan.Film, try each.value()) orelse return error.Usage;
         } else if (eql(arg, "--area")) {
@@ -247,6 +250,8 @@ fn scanCommand(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !
         } else return error.Usage;
     }
     if (!list and output == null) return error.Usage;
+    if (!list and dpi_y != null and dpi_y.? != dpi and
+        !std.mem.endsWith(u8, output.?, ".tiff") and !std.mem.endsWith(u8, output.?, ".tif")) return error.Usage;
 
     var library = scan.Library.load(gpa, io) catch |err| {
         std.log.err("no scanner library: {t}. On macOS and Linux minilab uses SANE, on Windows TWAIN.", .{err});
@@ -271,14 +276,16 @@ fn scanCommand(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !
     defer scanner.close();
     var capabilities = try scanner.capabilities(gpa, if (flatbed) .flatbed else .transparency);
     defer capabilities.deinit(gpa);
-    const resolution = capabilities.resolutionFrom(dpi) orelse return error.NoResolutions;
+    const resolution = if (dpi_y != null) dpi else capabilities.resolutionFrom(dpi) orelse return error.NoResolutions;
     var raw_buffer: [96]u8 = undefined;
     const setup = if (capabilities.profile) |p| p.summary else if (capabilities.options) |o| scan.rawSetup(o.items, &.{}).report.label(&raw_buffer) else "no profile: the data may not be linear";
     std.log.info("{s} {s}: {t}, {d} dpi, {s}", .{ device.vendor, device.model, capabilities.source, resolution, setup });
     var progress: scan.Progress = .{};
-    var image = try scanner.scan(gpa, .{ .source = capabilities.source, .film = film, .dpi = resolution, .area = area }, &progress);
+    var image = try scanner.scan(gpa, .{ .source = capabilities.source, .film = film, .dpi = resolution, .dpi_y = dpi_y, .area = area }, &progress);
     defer image.deinit(gpa);
-    const ppm = try minilab.pnm.write(gpa, u16, image.scan);
+    const is_tiff = std.mem.endsWith(u8, output.?, ".tiff") or std.mem.endsWith(u8, output.?, ".tif");
+    if (image.dpi[0] != image.dpi[1] and !is_tiff) return error.Usage;
+    const ppm = if (is_tiff) try minilab.roll.encodeRawAxes(gpa, image.scan, image.dpi[0], image.dpi[1]) else try minilab.pnm.write(gpa, u16, image.scan);
     defer gpa.free(ppm);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output.?, .data = ppm });
     std.log.info("{s}: {d} × {d} px, {d}-bit, {d:.2} × {d:.2} mm at {d:.2}, {d:.2} mm", .{ output.?, image.scan.width, image.scan.height, image.depth.bits(), image.area.width, image.area.height, image.area.x, image.area.y });

@@ -545,8 +545,18 @@ pub const Scanner = struct {
         // film or at 16 bits.
         const deep = scanner.hasDeepColour();
         try scanner.setUpRaw(gpa, .negative, &.{}, deep);
-        const resolutions = try scanner.rawResolutions(gpa);
+        const resolutions = try scanner.rawResolutions(gpa, "resolution");
         errdefer gpa.free(resolutions);
+        var axes: ?[2][]u32 = null;
+        if (scanner.find("x-resolution") != null and scanner.find("y-resolution") != null and
+            scanner.find("x-resolution").?.option.settable() and scanner.find("y-resolution").?.option.settable())
+        {
+            const x = try scanner.rawResolutions(gpa, "x-resolution");
+            errdefer gpa.free(x);
+            const y = try scanner.rawResolutions(gpa, "y-resolution");
+            axes = .{ x, y };
+        }
+        errdefer if (axes) |values| for (values) |a| gpa.free(a);
 
         // Without a profile, raw setup works from the options, and so do the scanner settings.
         var options: ?interface.Owned(interface.OptionInfo) = null;
@@ -561,6 +571,7 @@ pub const Scanner = struct {
             .sources = sources,
             .source = current,
             .resolutions = resolutions,
+            .axis_resolutions = axes,
             .area = scanner.fullArea(),
             .deep = deep,
             .film_setting = scanner.hasFilmSetting() or raw_film,
@@ -701,10 +712,10 @@ pub const Scanner = struct {
 
     /// The resolutions the scanner reads at with its raw settings in place, from lowest to
     /// highest: the ones it lists that it keeps when they're set, along with its bit depth.
-    fn rawResolutions(scanner: *Scanner, gpa: std.mem.Allocator) Error![]u32 {
+    fn rawResolutions(scanner: *Scanner, gpa: std.mem.Allocator, name: [:0]const u8) Error![]u32 {
         var listed: std.ArrayList(u32) = .empty;
         defer listed.deinit(gpa);
-        if (scanner.find("resolution")) |found| {
+        if (scanner.find(name)) |found| {
             const option = found.option;
             switch (option.constraint_type) {
                 .word_list => for (option.words()) |w| {
@@ -717,7 +728,7 @@ pub const Scanner = struct {
                     option.number(option.constraint.range.max),
                     option.number(option.constraint.range.quant),
                 ),
-                else => if (scanner.getNumber("resolution")) |value| if (interface.resolutionOf(value)) |r| try listed.append(gpa, r),
+                else => if (scanner.getNumber(name)) |value| if (interface.resolutionOf(value)) |r| try listed.append(gpa, r),
             }
         }
         std.mem.sortUnstable(u32, listed.items, {}, std.sort.asc(u32));
@@ -725,7 +736,7 @@ pub const Scanner = struct {
         var kept: std.ArrayList(u32) = .empty;
         errdefer kept.deinit(gpa);
         const depth = scanner.getNumber("depth");
-        for (listed.items) |r| if (scanner.keeps(r, depth)) try kept.append(gpa, r);
+        for (listed.items) |r| if (scanner.keeps(name, r, depth)) try kept.append(gpa, r);
         // A driver that keeps none of them can't be checked this way, so it gets its own list.
         if (kept.items.len == 0) return listed.toOwnedSlice(gpa);
         return kept.toOwnedSlice(gpa);
@@ -733,10 +744,10 @@ pub const Scanner = struct {
 
     /// Whether the scanner keeps resolution `dpi` as it is when it's set, and bit depth `depth`
     /// with it.
-    fn keeps(scanner: *Scanner, dpi: u32, depth: ?f64) bool {
-        const set = scanner.setNumber("resolution", @floatFromInt(dpi)) catch return false;
+    fn keeps(scanner: *Scanner, name: [:0]const u8, dpi: u32, depth: ?f64) bool {
+        const set = scanner.setNumber(name, @floatFromInt(dpi)) catch return false;
         if (!set) return false;
-        if (scanner.getNumber("resolution")) |now| if (@round(now) != @as(f64, @floatFromInt(dpi))) return false;
+        if (scanner.getNumber(name)) |now| if (@round(now) != @as(f64, @floatFromInt(dpi))) return false;
         if (depth) |bits| if (scanner.getNumber("depth")) |now| if (now != bits) return false;
         return true;
     }
@@ -779,7 +790,14 @@ pub const Scanner = struct {
         step = "the raw setup";
         try scanner.setUpRaw(gpa, request.film, request.raw, request.deep);
         step = "the resolution";
-        if (!try scanner.setNumber("resolution", @floatFromInt(request.dpi))) return error.Unsupported;
+        if (request.dpi_y != null) {
+            if (!try scanner.setNumber("x-resolution", @floatFromInt(request.dpi))) return error.Unsupported;
+            if (!try scanner.setNumber("y-resolution", @floatFromInt(request.dpi_y.?))) return error.Unsupported;
+            // Drivers may silently round an unsupported resolution. Never label that as native.
+            if (scanner.getNumber("x-resolution") != @as(f64, @floatFromInt(request.dpi)) or
+                scanner.getNumber("y-resolution") != @as(f64, @floatFromInt(request.dpi_y.?))) return error.Unsupported;
+            if (request.deep and scanner.getNumber("depth") != @as(f64, 16)) return error.Unsupported;
+        } else if (!try scanner.setNumber("resolution", @floatFromInt(request.dpi))) return error.Unsupported;
 
         // Now the area. Move the far corner out of the way first, so the near corner can go
         // anywhere.
