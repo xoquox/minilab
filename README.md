@@ -26,6 +26,10 @@ Written in **Zig 0.17** with a **Dear ImGui** interface. For how it works inside
 - **Frame detection:** finds the frames on a scanner preview, a strip scan or a camera shot, with
   several strips side by side in a flatbed's film holder.
 - **One workflow:** scanning, inversion, colour correction and batch export in one app.
+- **Reusable roll details:** type cameras, lenses and copyright names, or choose from
+  [saved entries](docs/saved-roll-details.md). Manage the suggestions separately from roll metadata.
+- **Light and dark appearance.** Switch from the selector in the top-right corner. Your choice
+  is remembered across libraries. See [appearance](docs/appearance.md).
 - **Datasheet corrections:** the film's datasheet curves open up crushed shadows and keep them
   neutral.
 - **Dust removal:** finds dust on a scan and fills it in with the film's own grain, with limits
