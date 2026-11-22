@@ -88,6 +88,10 @@ pub const Messages = struct {
     positive_film: [:0]const u8 = "Positive Film",
 
     resolution: [:0]const u8 = "Resolution",
+    native_resolution: [:0]const u8 = "Native X / Y resolution",
+    native_archive_note: [:0]const u8 = "Native TIFF kept; square-pixel working copy at {0} dpi",
+    native_save_failed: [:0]const u8 = "Native TIFF could not be saved; working scan kept",
+
     // How big each frame's scan will be. {0} by {1} is its size in pixels, and {2} its size in
     // MB. "About" when the size is from the roll's format, not a frame on the preview.
     size_about: [:0]const u8 = "About {0} × {1} px per frame",
