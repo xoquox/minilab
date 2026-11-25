@@ -5,7 +5,7 @@
 </p>
 
 This fork of [minilab](https://github.com/vdmkenny/minilab) is adapted primarily for the
-**Epson Perfection V600 Photo on Linux**, with the local setup used on NixOS. It keeps the
+**Epson Perfection V600 Photo on Linux**. It keeps the
 original scanning, developing and export workflow, with the additions below. The V600-specific
 changes have not been validated on other scanners or platforms.
 
