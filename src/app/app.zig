@@ -1,7 +1,6 @@
 //! The app: its window, the workspaces in the header, and the one loop that draws them.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const minilab = @import("minilab");
 const c = @import("c");
 const Window = @import("../platform/window.zig").Window;
@@ -20,6 +19,8 @@ const scan_view = @import("scan_view.zig");
 const export_view = @import("export_view.zig");
 const looks_view = @import("looks_view.zig");
 const update_view = @import("update_view.zig");
+const settings_view = @import("settings_view.zig");
+const i18n = @import("../i18n/i18n.zig");
 const update_worker = @import("update_worker.zig");
 const version = @import("../version.zig");
 
@@ -39,6 +40,10 @@ pub const Options = struct {
     workspace: Workspace = .rolls,
     /// Show the keyboard shortcuts at start.
     shortcuts: bool = false,
+    /// Where the preferences are kept, or null to start with the defaults and not keep them.
+    preferences: ?[]const u8 = null,
+    /// The interface's language for this run, over the one in the preferences.
+    language: ?minilab.preferences.Language = null,
 };
 
 /// Which panels are showing. Tab hides the side panels, and Shift-Tab hides everything but the
@@ -70,7 +75,8 @@ const header = struct {
     const tab_padding_y = 8;
     const tab_gap = 2;
     const tab_rounding = 4;
-    const appearance_width = 90;
+    /// The Settings button at the right end.
+    const settings_size = 28;
     /// The amber line under the current tab.
     const tab_underline = 2;
     /// The dot that shows whether the scanner is ready.
@@ -86,22 +92,19 @@ const Notice = context.Notice;
 /// Runs the app until it's closed. After an update, returns the program's folder, for the new
 /// version to start from there.
 pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !?[]u8 {
-    const preferences_path = try minilab.preferences.pathFor(gpa, builtin.os.tag, options.home, environment("XDG_CONFIG_HOME"), environment("APPDATA"));
-    defer if (preferences_path) |path| gpa.free(path);
-    var preferences = try minilab.preferences.Settings.load(gpa, io, preferences_path);
-    defer preferences.deinit();
-    theme.choose(preferences.theme);
+    // A screenshot shows the app as anyone first sees it, whatever this account prefers.
+    const preferences: minilab.preferences.Saved = try .load(gpa, io, if (options.screenshot == null) options.preferences else null);
     var window: Window = try .open("minilab", start_width, start_height, options.screenshot != null);
     defer window.close();
     gui.scale = window.scale;
     fonts.load(window.scale);
-    theme.apply(window.scale);
+    theme.apply(window.scale, settings_view.look(preferences.values, window.system_light));
 
     var app: App = .{
         .library = try .load(gpa, io, options.library, options.home),
         .workspace = options.workspace,
         .show_help = options.shortcuts,
-        .preferences = &preferences,
+        .preferences = preferences,
     };
     defer app.deinit(gpa, io, window.gpu);
     try app.openAtStart(gpa, io, options);
@@ -119,19 +122,23 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !?[]u8 {
             library_checked = c.SDL_GetTicks();
             app.library.refresh(gpa, io);
         }
-        if (theme.mode != preferences.theme) {
-            theme.choose(preferences.theme);
-            theme.applyColors();
-        }
+        // Between frames, so no frame mixes two looks.
+        const look = settings_view.look(app.preferences.values, window.system_light);
+        if (!std.meta.eql(look, theme.current)) theme.use(look);
+        // A screenshot is in the language asked for, or English, whatever this computer uses.
+        var asked = app.preferences.values;
+        if (options.language) |l| asked.language = l;
+        const language = settings_view.language(asked, if (options.screenshot == null) window.system_language else null);
+        if (language != i18n.current) i18n.use(language);
         gui.newFrame();
         const keys = shortcuts.poll();
-        const ctx: context.Context = .{ .gpa = gpa, .io = io, .gpu = window.gpu, .library = &app.library, .develop = &app.develop, .keys = keys, .notice = &app.notice };
+        const ctx: context.Context = .{ .gpa = gpa, .io = io, .gpu = window.gpu, .library = &app.library, .develop = &app.develop, .keys = keys, .notice = &app.notice, .preferences = &app.preferences };
         app.handleKeys(ctx, &window);
         // Scanned frames go into their roll whichever workspace is showing, and the header picks
         // up the scanner's state. A screenshot run leaves the scanners alone unless it's showing
         // Scan.
         if (options.screenshot == null or app.workspace == .scan) scan_view.update(&app.scan, ctx);
-        try app.draw(ctx, &window.dropped);
+        try app.draw(ctx, &window.dropped, window.system_language);
         if (app.show_help) app.show_help = shortcuts.drawHelp();
 
         // If any thumbnail was asked for while drawing and isn't made yet, this frame was missing
@@ -145,7 +152,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !?[]u8 {
         if (app.restart) window.close_asked = true;
 
         frames_drawn += 1;
-        const background: [4]f32 = .{ theme.page.x, theme.page.y, theme.page.z, 1 };
+        const background: [4]f32 = .{ theme.colors.page.x, theme.colors.page.y, theme.colors.page.z, 1 };
         if (options.screenshot) |path| {
             loaded_frames = if (complete and app.settled()) loaded_frames + 1 else 0;
             if ((frames_drawn >= screenshot_frames and loaded_frames >= screenshot_loaded_frames) or frames_drawn == screenshot_frames_max) {
@@ -176,10 +183,12 @@ const App = struct {
     workspace: Workspace,
     panels: Panels = .all,
     show_help: bool,
-    preferences: *minilab.preferences.Settings,
     /// Looks for an update, and installs one.
     updates: ?*update_worker.Worker = null,
     update_window: update_view.State = .{},
+    settings: settings_view.State = .{},
+    /// The app's preferences, the same in every library.
+    preferences: minilab.preferences.Saved,
     /// Set once an update is installed, to close and start the new version.
     restart: bool = false,
 
@@ -191,6 +200,7 @@ const App = struct {
         app.scan.deinit(gpa, gpu);
         app.rolls.deinit(gpa);
         app.library.deinit(gpa, gpu);
+        app.preferences.deinit(gpa);
     }
 
     /// Opens the roll and the scans the command line names.
@@ -213,27 +223,27 @@ const App = struct {
         }
         if (keys.contains(.import)) app.workspace = .scan;
         if (keys.contains(.help)) app.show_help = !app.show_help;
+        if (keys.contains(.settings)) app.settings.open = true;
         if (keys.contains(.quit)) window.close_asked = true;
         if (keys.contains(.full_screen)) window.toggleFullScreen();
         if (keys.contains(.hide_panels)) app.panels = if (app.panels == .all) .viewer_and_header else .all;
         if (keys.contains(.hide_all)) app.panels = if (app.panels == .viewer) .all else .viewer;
         if (keys.contains(.new_roll)) {
             app.workspace = .rolls;
-            app.rolls.show_form = true;
-            app.rolls.form = .{};
+            app.rolls.openNewRoll(ctx.gpa);
         }
         if (keys.contains(.find)) {
             app.workspace = .rolls;
             app.rolls.focus_search = true;
         }
-        if (keys.contains(.cancel) and app.workspace == .rolls) app.rolls.show_form = false;
+        if (keys.contains(.cancel) and app.workspace == .rolls) app.rolls.closePanel(ctx.gpa);
         if (app.workspace == .develop) {
             if (app.develop.handle(ctx.gpa, ctx.io, ctx.library, keys)) |message| app.notice.set("{s}", .{message});
         }
     }
 
     /// Draws the window: the header, then the workspace, which gets what was dropped on it.
-    fn draw(app: *App, ctx: context.Context, dropped_files: *const Dropped) !void {
+    fn draw(app: *App, ctx: context.Context, dropped_files: *const Dropped, system_language: ?minilab.preferences.Language) !void {
         const dropped = dropped_files.files();
         const drop: ?gui.Vec2 = if (dropped.len > 0) gui.vec2(dropped_files.position[0], dropped_files.position[1]) else null;
         if (dropped.len > 0 and app.workspace == .looks) {
@@ -251,7 +261,12 @@ const App = struct {
         _ = c.ImGui_Begin("minilab", null, c.ImGuiWindowFlags_NoDecoration | c.ImGuiWindowFlags_NoMove | c.ImGuiWindowFlags_NoBringToFrontOnFocus);
         c.ImGui_PopStyleVar();
         defer c.ImGui_End();
-        if (app.panels != .viewer and drawHeader(&app.workspace, &app.notice, &app.library, &app.develop, scan_view.status(&app.scan), update_view.headerLabel(app.updates), app.preferences, ctx.io)) app.update_window.open = true;
+        if (app.panels != .viewer) switch (drawHeader(&app.workspace, &app.notice, &app.library, &app.develop, scan_view.status(&app.scan), update_view.headerLabel(app.updates))) {
+            .none => {},
+            .update => app.update_window.open = true,
+            .settings => app.settings.open = true,
+        };
+        settings_view.draw(&app.settings, &app.scan, ctx, system_language);
         // A scan or an export running would be cut short by restarting into an update.
         if (app.updates) |worker| {
             if (update_view.draw(&app.update_window, worker, ctx, app.scan.scanning or app.exporting.running != null)) app.restart = true;
@@ -273,6 +288,10 @@ const App = struct {
                     .rolls, .develop => unreachable,
                 };
                 if (next) |w| app.workspace = w;
+                if (app.scan.open_settings) {
+                    app.scan.open_settings = false;
+                    app.settings.openAt(.scanner);
+                }
             },
         }
     }
@@ -283,15 +302,14 @@ const App = struct {
         const io = ctx.io;
         const library = &app.library;
         switch (action) {
-            .none => if (dropped.len > 0) app.notice.set("Drop on a roll's row", .{}),
+            .none => if (dropped.len > 0) app.notice.say(i18n.t.app.drop_on_roll, .{}),
             .open => |at| {
                 try app.develop.openRoll(gpa, io, library, library.rolls.items[at.roll].path);
                 if (at.frame < library.rolls.items[at.roll].frames.items.len) app.develop.select(gpa, io, library, at.frame);
                 app.workspace = .develop;
             },
             .created => |created| {
-                if (created.flat_failed) app.notice.set("Flat field not set", .{});
-                if (created.details_failed) app.notice.set("Roll created; saved entries could not be updated", .{});
+                if (created.flat_failed) app.notice.say(i18n.t.app.flat_field_not_set, .{});
                 try app.develop.openRoll(gpa, io, library, library.rolls.items[created.roll].path);
                 app.workspace = if (library.rolls.items[created.roll].info.input == .scanner) .scan else .develop;
             },
@@ -304,8 +322,8 @@ const App = struct {
                 const name = std.fmt.bufPrint(&name_buffer, "{s}", .{library.rolls.items[index].info.name}) catch library.rolls.items[index].info.name;
                 app.develop.forgetRoll(gpa, library.rolls.items[index].path);
                 if (library.trashRoll(gpa, io, index)) |_| {
-                    app.notice.set("Moved {s} to Trash", .{name});
-                } else |err| app.notice.set("Can't move {s} to Trash · {t}", .{ name, err });
+                    app.notice.say(i18n.t.app.moved_to_trash, .{name});
+                } else |err| app.notice.say(i18n.t.app.cant_move_to_trash, .{ name, @errorName(err) });
             },
         }
     }
@@ -327,7 +345,7 @@ const App = struct {
 fn dropScans(gpa: std.mem.Allocator, io: std.Io, library: *Library, develop: *develop_view.State, dropped: []const []const u8, notice: *Notice) void {
     // A folder stands for the scans in it.
     const paths = minilab.input.expand(gpa, io, dropped) catch |err| {
-        notice.set("Can't read what was dropped · {t}", .{err});
+        notice.say(i18n.t.app.cant_read_dropped, .{@errorName(err)});
         return;
     };
     defer minilab.input.freeExpanded(gpa, paths);
@@ -336,9 +354,9 @@ fn dropScans(gpa: std.mem.Allocator, io: std.Io, library: *Library, develop: *de
         const added = library.rolls.items[r].frames.items.len - imported.first;
         const name = library.rolls.items[r].info.name;
         if (added == imported.files) {
-            notice.set("Added {d} of {d} scans to {s}", .{ added, paths.len, name });
+            notice.say(i18n.t.app.added_scans, .{ added, paths.len, name });
         } else {
-            notice.set("Added {d} frames from {d} of {d} scans to {s}", .{ added, imported.files, paths.len, name });
+            notice.say(i18n.t.app.added_frames, .{ added, imported.files, paths.len, name });
         }
         if (added > 0) develop.select(gpa, io, library, imported.first);
         return;
@@ -346,15 +364,18 @@ fn dropScans(gpa: std.mem.Allocator, io: std.Io, library: *Library, develop: *de
     for (paths) |path| develop.openLoose(gpa, io, library, path) catch |err| std.log.err("can't open {s}: {t}", .{ path, err });
 }
 
-/// Draws the header. Returns true when the update notice, `update`, was clicked.
-fn drawHeader(workspace: *Workspace, notice: *Notice, library: *const Library, develop: *const develop_view.State, scanner: @TypeOf(scan_view.status(undefined)), update: ?[:0]const u8, preferences: *minilab.preferences.Settings, io: std.Io) bool {
-    var update_clicked = false;
+/// What was clicked in the header.
+const HeaderClick = enum { none, update, settings };
+
+/// Draws the header. Returns what was clicked: the update notice, `update`, or the Settings button.
+fn drawHeader(workspace: *Workspace, notice: *const Notice, library: *const Library, develop: *const develop_view.State, scanner: @TypeOf(scan_view.status(undefined)), update: ?[:0]const u8) HeaderClick {
+    var clicked: HeaderClick = .none;
     const origin = c.ImGui_GetCursorScreenPos();
     const width = c.ImGui_GetContentRegionAvail().x;
     const height = gui.px(header.height);
     const list = c.ImGui_GetWindowDrawList();
-    c.ImDrawList_AddRectFilled(list, origin, gui.vec2(origin.x + width, origin.y + height), theme.imU32(theme.header));
-    c.ImDrawList_AddLine(list, gui.vec2(origin.x, origin.y + height - 1), gui.vec2(origin.x + width, origin.y + height - 1), theme.imU32(theme.divider));
+    c.ImDrawList_AddRectFilled(list, origin, gui.vec2(origin.x + width, origin.y + height), theme.imU32(theme.colors.header));
+    c.ImDrawList_AddLineH(list, origin.x, origin.x + width, origin.y + height - 1, theme.imU32(theme.colors.divider));
     const middle = origin.y + height / 2;
 
     // The mark: a frame of film with its perforations, then the name.
@@ -362,14 +383,14 @@ fn drawHeader(workspace: *Workspace, notice: *Notice, library: *const Library, d
     fonts.pushSized(.semibold, fonts.wordmark_size);
     const name_size = c.ImGui_CalcTextSize("minilab");
     const name_x = origin.x + gui.px(header.padding + header.mark_size + header.mark_gap);
-    c.ImDrawList_AddText(list, gui.vec2(name_x, middle - name_size.y / 2), theme.imU32(theme.text), "minilab");
+    c.ImDrawList_AddText(list, gui.vec2(name_x, middle - name_size.y / 2), theme.imU32(theme.colors.text), "minilab");
     fonts.pop();
     // The version, small, beside the name.
     fonts.pushSized(.mono, fonts.tiny_size);
     const version_text = gui.print("{s}", .{version.string});
     const version_size = c.ImGui_CalcTextSize(version_text);
     const version_x = name_x + name_size.x + gui.px(header.version_gap);
-    c.ImDrawList_AddText(list, gui.vec2(version_x, middle - version_size.y / 2 + gui.px(header.version_drop)), theme.imU32(theme.text_tertiary), version_text);
+    c.ImDrawList_AddText(list, gui.vec2(version_x, middle - version_size.y / 2 + gui.px(header.version_drop)), theme.imU32(theme.colors.text_tertiary), version_text);
     fonts.pop();
 
     // The workspaces, as tabs.
@@ -386,39 +407,34 @@ fn drawHeader(workspace: *Workspace, notice: *Notice, library: *const Library, d
         const current = workspace.* == w;
         const far = gui.vec2(corner.x + tab_width, corner.y + tab_height);
         if (current) {
-            c.ImDrawList_AddRectFilledEx(list, corner, far, theme.imU32(theme.control), gui.px(header.tab_rounding), 0);
-            c.ImDrawList_AddRectFilledEx(list, gui.vec2(corner.x, far.y - gui.px(header.tab_underline)), far, theme.imU32(theme.accent), gui.px(header.tab_rounding), c.ImDrawFlags_RoundCornersBottom);
+            c.ImDrawList_AddRectFilledEx(list, corner, far, theme.imU32(theme.colors.control), gui.px(header.tab_rounding), 0);
+            c.ImDrawList_AddRectFilledEx(list, gui.vec2(corner.x, far.y - gui.px(header.tab_underline)), far, theme.imU32(theme.colors.accent), gui.px(header.tab_rounding), c.ImDrawFlags_RoundBottom);
         }
         const size = c.ImGui_CalcTextSize(label);
-        c.ImDrawList_AddText(list, gui.vec2(corner.x + (tab_width - size.x) / 2, middle - size.y / 2), theme.imU32(if (current or hovered) theme.text else theme.text_secondary), label);
+        c.ImDrawList_AddText(list, gui.vec2(corner.x + (tab_width - size.x) / 2, middle - size.y / 2), theme.imU32(if (current or hovered) theme.colors.text else theme.colors.text_secondary), label);
         x += tab_width + gui.px(header.tab_gap);
     }
 
-    // On the right: what just happened, the open roll, and the scanner.
-    var right = origin.x + width - gui.px(header.padding);
-    right -= gui.px(header.appearance_width);
-    c.ImGui_SetCursorScreenPos(gui.vec2(right, middle - tab_height / 2));
-    if (gui.comboOf(theme.Mode, "appearance", std.enums.values(theme.Mode), preferences.theme, theme.Mode.label, header.appearance_width)) |picked| {
-        preferences.setTheme(io, picked) catch |err| {
-            std.log.warn("theme changed, but preference was not saved: {t}", .{err});
-            notice.set("Theme changed; preference not saved", .{});
-        };
-    }
-    gui.tooltip("Appearance");
+    // On the right: what just happened, the open roll, the scanner, and Settings.
+    var right = origin.x + width - gui.px(header.padding) - gui.px(header.settings_size);
+    c.ImGui_SetCursorScreenPos(gui.vec2(right, middle - gui.px(header.settings_size) / 2));
+    if (gui.buttonOf(.quiet, "##settings", gui.vec2(header.settings_size, header.settings_size))) clicked = .settings;
+    shortcuts.tooltip(i18n.t.settings.title, .settings);
+    gui.drawIcon(.settings, gui.vec2(right + gui.px(header.settings_size) / 2, middle), if (c.ImGui_IsItemHovered(0)) theme.colors.text else theme.colors.text_secondary);
     right -= gui.px(header.padding);
-    const scanner_text = gui.elideEnd(scanner.text, @max(0, right - x - gui.px(header.dot_gap + 2 * header.dot_radius + header.padding)));
+    const scanner_text = gui.print("{s}", .{scanner.text});
     const scanner_size = c.ImGui_CalcTextSize(scanner_text);
     right -= scanner_size.x;
-    c.ImDrawList_AddText(list, gui.vec2(right, middle - scanner_size.y / 2), theme.imU32(theme.text_secondary), scanner_text);
-    c.ImDrawList_AddCircleFilled(list, gui.vec2(right - gui.px(header.dot_gap + header.dot_radius), middle), gui.px(header.dot_radius), theme.imU32(if (scanner.ready) theme.ready else theme.text_tertiary), header.dot_segments);
+    c.ImDrawList_AddText(list, gui.vec2(right, middle - scanner_size.y / 2), theme.imU32(theme.colors.text_secondary), scanner_text);
+    c.ImDrawList_AddCircleFilled(list, gui.vec2(right - gui.px(header.dot_gap + header.dot_radius), middle), gui.px(header.dot_radius), theme.imU32(if (scanner.ready) theme.colors.ready else theme.colors.text_tertiary), header.dot_segments);
     right -= gui.px(header.dot_gap + 2 * header.dot_radius + header.padding);
     if (update) |label| {
         const size = c.ImGui_CalcTextSize(label);
         right -= size.x;
         const corner = gui.vec2(right, middle - size.y / 2);
         c.ImGui_SetCursorScreenPos(corner);
-        update_clicked = c.ImGui_InvisibleButton("update", size, 0);
-        const ink = if (c.ImGui_IsItemHovered(0)) theme.text else theme.accent;
+        if (c.ImGui_InvisibleButton("update", size, 0)) clicked = .update;
+        const ink = if (c.ImGui_IsItemHovered(0)) theme.colors.text else theme.colors.accent;
         c.ImDrawList_AddText(list, corner, theme.imU32(ink), label);
         right -= gui.px(header.padding);
     }
@@ -426,25 +442,25 @@ fn drawHeader(workspace: *Workspace, notice: *Notice, library: *const Library, d
         if (develop.rollIndex(library)) |r| {
             const info = library.rolls.items[r].info;
             const film = info.format.format().size;
-            const roll_text = gui.elideEnd(gui.print("{s} · {s} · {s}", .{ info.name, info.stock orelse labels.filmKind(info.kind), labels.filmSize(film) }), @max(0, right - x - gui.px(header.padding)));
+            const roll_text = gui.print("{s} · {s} · {s}", .{ info.name, info.stock orelse labels.filmKind(info.kind), labels.filmSize(film) });
             const size = c.ImGui_CalcTextSize(roll_text);
             right -= size.x;
-            c.ImDrawList_AddText(list, gui.vec2(right, middle - size.y / 2), theme.imU32(theme.text_secondary), roll_text);
+            c.ImDrawList_AddText(list, gui.vec2(right, middle - size.y / 2), theme.imU32(theme.colors.text_secondary), roll_text);
             right -= gui.px(header.padding);
         }
     }
     if (notice.text()) |message| {
         const shown = gui.elideStart(message, @max(0, right - x - gui.px(header.padding)));
         const size = c.ImGui_CalcTextSize(shown);
-        c.ImDrawList_AddText(list, gui.vec2(right - size.x, middle - size.y / 2), theme.imU32(theme.accent), shown);
+        c.ImDrawList_AddText(list, gui.vec2(right - size.x, middle - size.y / 2), theme.imU32(theme.colors.accent), shown);
     }
     c.ImGui_SetCursorScreenPos(gui.vec2(origin.x, origin.y + height));
-    return update_clicked;
+    return clicked;
 }
 
 /// Draws the app's mark, the icon's film strip, 20 pixels square at `corner`.
 fn drawMark(list: *c.ImDrawList, corner: gui.Vec2) void {
-    const ink = theme.imU32(theme.accent);
+    const ink = theme.imU32(theme.colors.accent);
     const thickness = gui.px(icon.stroke);
     const p = struct {
         fn at(o: gui.Vec2, point: [2]f32) gui.Vec2 {
@@ -455,9 +471,5 @@ fn drawMark(list: *c.ImDrawList, corner: gui.Vec2) void {
     const min = p(corner, .{ o.centre[0] - o.half[0], o.centre[1] - o.half[1] });
     const max = p(corner, .{ o.centre[0] + o.half[0], o.centre[1] + o.half[1] });
     c.ImDrawList_AddRectEx(list, min, max, ink, gui.px(o.radius), thickness, 0);
-    for (icon.segments) |s| c.ImDrawList_AddLineEx(list, p(corner, s[0]), p(corner, s[1]), ink, thickness);
-}
-
-fn environment(name: [:0]const u8) ?[]const u8 {
-    return if (std.c.getenv(name.ptr)) |value| std.mem.span(value) else null;
+    for (icon.segments) |s| c.ImDrawList_AddLineEx(list, p(corner, s[0]), p(corner, s[1]), ink, thickness, 0);
 }

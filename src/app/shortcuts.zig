@@ -11,6 +11,7 @@ const c = @import("c");
 const gui = @import("../ui/gui.zig");
 const theme = @import("../ui/theme.zig");
 const fonts = @import("../ui/fonts.zig");
+const i18n = @import("../i18n/i18n.zig");
 
 pub const Command = enum {
     rolls,
@@ -60,62 +61,18 @@ pub const Command = enum {
     hide_panels,
     hide_all,
     full_screen,
+    settings,
     help,
     quit,
     cancel,
 
-    pub fn describe(command: Command) []const u8 {
+    /// What the command does, in the interface's language.
+    pub fn describe(command: Command) [:0]const u8 {
         return switch (command) {
-            .rolls => "Rolls",
-            .scan => "Scan",
-            .develop => "Develop",
-            .@"export" => "Export",
-            .looks => "Looks",
-            .previous => "Previous frame",
-            .next => "Next frame",
-            .first => "First frame",
-            .last => "Last frame",
-            .zoom_toggle => "Fit or 100%",
-            .zoom_in => "Zoom to 100%",
-            .zoom_out => "Zoom to fit",
-            .clipping => "Show clipping",
-            .loupe => "Loupe",
-            .before => "Negative or positive",
-            .split => "Split view",
-            .white_balance => "Pick white balance",
-            .base => "Pick film base",
-            .crop => "Crop",
-            .turn_left => "Turn left",
-            .turn_right => "Turn right",
-            .mirror => "Mirror left to right",
-            .confirm => "Finish the crop",
-            .undo => "Undo",
-            .redo => "Redo",
-            .copy_settings => "Copy settings",
-            .paste_settings => "Paste settings",
-            .paste_previous => "Paste from previous frame",
-            .sync => "Sync settings to roll",
-            .reset => "Reset settings",
-            .automatic => "Automatic settings",
-            .no_stars => "No stars",
-            .one_star => "1 star",
-            .two_stars => "2 stars",
-            .three_stars => "3 stars",
-            .four_stars => "4 stars",
-            .five_stars => "5 stars",
-            .reject => "Reject",
-            .unreject => "Clear reject",
-            .new_roll => "New roll",
-            .find => "Find rolls",
-            .import => "Import (Scan)",
-            .select_all => "Select all frames",
-            .select_none => "Select no frames",
-            .hide_panels => "Hide side panels",
-            .hide_all => "Hide all panels",
-            .full_screen => "Full screen",
-            .help => "Keyboard shortcuts",
-            .quit => "Quit",
-            .cancel => "Cancel a pick, close a panel",
+            inline .rolls, .scan, .develop, .@"export", .looks => |w| @field(i18n.t.labels.workspace, @tagName(w)),
+            .settings => i18n.t.settings.title,
+            .help => i18n.t.shortcuts.title,
+            inline else => |tag| @field(i18n.t.shortcuts.command, @tagName(tag)),
         };
     }
 
@@ -213,6 +170,7 @@ pub const bindings = [_]Binding{
     bind(.hide_panels, c.ImGuiKey_Tab),
     bind(.hide_all, shift | c.ImGuiKey_Tab),
     bind(.full_screen, c.ImGuiKey_F),
+    bind(.settings, command_key | c.ImGuiKey_Comma),
     bind(.help, command_key | c.ImGuiKey_Slash),
     bind(.quit, command_key | c.ImGuiKey_Q),
     bind(.cancel, c.ImGuiKey_Escape),
@@ -229,16 +187,19 @@ fn repeats(command: Command) bool {
 const mods_mask = c.ImGuiMod_Ctrl | c.ImGuiMod_Shift | c.ImGuiMod_Alt | c.ImGuiMod_Super;
 
 /// Returns the commands whose keys were pressed this frame. While a text field has the keyboard,
-/// only Escape and shortcuts with the Command key count, so typing never triggers a tool.
+/// only Escape and shortcuts with the Command key count, so typing never triggers a tool. While
+/// something is being dragged, Escape belongs to the drag: it cancels a slider's (`gui.slider`).
 pub fn poll() std.EnumSet(Command) {
     var pressed: std.EnumSet(Command) = .empty;
     const io = c.ImGui_GetIO();
     const typing = io.*.WantTextInput;
+    const dragging = !typing and c.ImGui_IsAnyItemActive() and c.ImGui_IsMouseDown(c.ImGuiMouseButton_Left);
     const mods = io.*.KeyMods & mods_mask;
     for (bindings) |b| {
         const wanted = b.chord & mods_mask;
         const key: c.ImGuiKey = @intCast(b.chord & ~@as(c_int, mods_mask));
         if (typing and wanted & command_key == 0 and key != c.ImGuiKey_Escape) continue;
+        if (dragging and key == c.ImGuiKey_Escape) continue;
         // In a text field, ⌘C, ⌘V, ⌘A and ⌘Z belong to the field.
         if (typing and wanted == command_key) continue;
         if (mods != wanted) continue;
@@ -282,6 +243,7 @@ fn keyName(key: c.ImGuiKey) []const u8 {
         c.ImGuiKey_RightArrow => "→",
         c.ImGuiKey_Backslash => "\\",
         c.ImGuiKey_Slash => "/",
+        c.ImGuiKey_Comma => ",",
         c.ImGuiKey_LeftBracket => "[",
         c.ImGuiKey_RightBracket => "]",
         c.ImGuiKey_Enter => if (builtin.os.tag == .macos) "↩" else "Enter",
@@ -302,7 +264,7 @@ pub fn tooltip(text: []const u8, command: Command) void {
     gui.text(text);
     c.ImGui_SameLineEx(0, gui.px(tooltip_keys_gap));
     fonts.pushSized(.mono, fonts.small_size);
-    gui.textColored(theme.text_tertiary, label(command));
+    gui.textColored(theme.colors.text_tertiary, label(command));
     fonts.pop();
 }
 
@@ -326,16 +288,19 @@ const help = struct {
     const second_column = 4;
 };
 
+/// The help panel's groups of shortcuts, each headed by its message in `i18n.t.shortcuts.heading`.
+const Group = enum { workspaces, frames, viewer, tools, settings, rating, library, window };
+
 /// Every shortcut, in groups, for the help panel.
-const groups = [_]struct { []const u8, []const Command }{
-    .{ "WORKSPACES", &.{ .rolls, .scan, .develop, .@"export", .looks } },
-    .{ "FRAMES", &.{ .previous, .next, .first, .last, .select_all, .select_none } },
-    .{ "VIEWER", &.{ .zoom_toggle, .zoom_in, .zoom_out, .clipping, .loupe, .before, .split } },
-    .{ "TOOLS", &.{ .white_balance, .base, .crop, .turn_left, .turn_right, .mirror, .confirm } },
-    .{ "SETTINGS", &.{ .undo, .redo, .copy_settings, .paste_settings, .paste_previous, .sync, .reset, .automatic } },
-    .{ "RATING", &.{ .no_stars, .one_star, .two_stars, .three_stars, .four_stars, .five_stars, .reject, .unreject } },
-    .{ "LIBRARY", &.{ .new_roll, .find, .import } },
-    .{ "WINDOW", &.{ .hide_panels, .hide_all, .full_screen, .help, .quit, .cancel } },
+const groups = [_]struct { Group, []const Command }{
+    .{ .workspaces, &.{ .rolls, .scan, .develop, .@"export", .looks } },
+    .{ .frames, &.{ .previous, .next, .first, .last, .select_all, .select_none } },
+    .{ .viewer, &.{ .zoom_toggle, .zoom_in, .zoom_out, .clipping, .loupe, .before, .split } },
+    .{ .tools, &.{ .white_balance, .base, .crop, .turn_left, .turn_right, .mirror, .confirm } },
+    .{ .settings, &.{ .undo, .redo, .copy_settings, .paste_settings, .paste_previous, .sync, .reset, .automatic } },
+    .{ .rating, &.{ .no_stars, .one_star, .two_stars, .three_stars, .four_stars, .five_stars, .reject, .unreject } },
+    .{ .library, &.{ .new_roll, .find, .import } },
+    .{ .window, &.{ .hide_panels, .hide_all, .full_screen, .settings, .help, .quit, .cancel } },
 };
 
 // Every command has keys and a place in the help panel, and no two commands share keys.
@@ -363,14 +328,14 @@ pub fn drawHelp() bool {
     const size = gui.vec2(gui.px(help.width), @min(viewport.*.WorkSize.y - gui.px(help.margin_y), gui.px(help.max_height)));
     c.ImGui_SetNextWindowPos(gui.vec2(viewport.*.WorkPos.x + (viewport.*.WorkSize.x - size.x) / 2, viewport.*.WorkPos.y + gui.px(help.top)), 0);
     c.ImGui_SetNextWindowSize(size, 0);
-    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_WindowBg, theme.panel);
+    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_WindowBg, theme.colors.panel);
     c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_WindowPadding, gui.vec2(gui.px(help.padding_x), gui.px(help.padding_y)));
     c.ImGui_PushStyleVar(c.ImGuiStyleVar_WindowBorderSize, 1);
     defer c.ImGui_PopStyleVarEx(2);
     defer c.ImGui_PopStyleColor();
-    if (c.ImGui_Begin("Keyboard shortcuts", &open, c.ImGuiWindowFlags_NoCollapse | c.ImGuiWindowFlags_NoResize | c.ImGuiWindowFlags_NoMove | c.ImGuiWindowFlags_NoTitleBar)) {
-        gui.title("Keyboard shortcuts", fonts.title_size);
-        gui.textColored(theme.text_tertiary, "As in Lightroom and Bridge");
+    if (c.ImGui_Begin("##keyboard shortcuts", &open, c.ImGuiWindowFlags_NoCollapse | c.ImGuiWindowFlags_NoResize | c.ImGuiWindowFlags_NoMove | c.ImGuiWindowFlags_NoTitleBar)) {
+        gui.title(i18n.t.shortcuts.title, fonts.title_size);
+        gui.textColored(theme.colors.text_tertiary, i18n.t.shortcuts.subtitle);
         c.ImGui_Dummy(gui.vec2(0, gui.px(help.group_gap)));
         const column = (c.ImGui_GetContentRegionAvail().x - gui.px(help.column_gap)) / 2;
         const second_x = gui.px(help.padding_x + help.column_gap) + column;
@@ -381,11 +346,11 @@ pub fn drawHelp() bool {
             const in_second = g >= help.second_column;
             const x = c.ImGui_GetCursorPosX();
             if (in_second) c.ImGui_SetCursorPosX(second_x);
-            gui.heading(group[0]);
+            gui.heading(i18n.label(i18n.t.shortcuts.heading, group[0]));
             for (group[1]) |command| {
                 if (in_second) c.ImGui_SetCursorPosX(second_x);
                 const row_x = c.ImGui_GetCursorPosX();
-                gui.textColored(theme.text_secondary, command.describe());
+                gui.textColored(theme.colors.text_secondary, command.describe());
                 c.ImGui_SameLineEx(row_x + column - gui.px(help.keys_width), 0);
                 fonts.pushSized(.mono, fonts.small_size);
                 gui.text(label(command));

@@ -9,11 +9,18 @@ const trash = @import("../platform/trash.zig");
 
 const image = minilab.image;
 const roll = minilab.roll;
+const gui = @import("../ui/gui.zig");
 const labels = @import("labels.zig");
 
 pub const Key = struct { roll: usize, frame: usize };
 
 pub const Library = struct {
+    /// The values `which` has across the rolls, newest first, to suggest when filling it in.
+    /// They last for this frame.
+    pub fn suggestions(library: *const Library, which: roll.Detail) []const []const u8 {
+        return roll.detailValues(gui.frameAllocator(), library.rolls.items, which) catch &.{};
+    }
+
     path: []const u8,
     /// The user's home folder, if known: Linux's Trash is in it.
     home: ?[]const u8,
@@ -32,7 +39,6 @@ pub const Library = struct {
     calibrations: minilab.calibration.Calibrations,
     /// The user's changes to raw setup, per scanner.
     scanner_settings: minilab.scanner_settings.Settings,
-    saved_details: minilab.saved_details.Settings,
     /// Thumbnails dropped during a frame. ImGui may still draw them in that frame, so they're only
     /// released once it has been drawn (`releaseRetired`).
     retired: std.ArrayList(Texture) = .empty,
@@ -55,14 +61,6 @@ pub const Library = struct {
         errdefer calibrations.deinit();
         var scanner_settings: minilab.scanner_settings.Settings = try .load(gpa, io, path);
         errdefer scanner_settings.deinit();
-        var saved_details = try minilab.saved_details.Settings.load(gpa, io, path);
-        errdefer saved_details.deinit();
-        var rolls = try roll.listRolls(gpa, io, path);
-        errdefer {
-            for (rolls.items) |*r| r.close();
-            rolls.deinit(gpa);
-        }
-        learnDetails(&saved_details, gpa, io, rolls.items);
         return .{
             .path = owned_path,
             .home = owned_home,
@@ -70,8 +68,7 @@ pub const Library = struct {
             .looks = looks,
             .calibrations = calibrations,
             .scanner_settings = scanner_settings,
-            .saved_details = saved_details,
-            .rolls = rolls,
+            .rolls = try roll.listRolls(gpa, io, path),
             .gpa = gpa,
         };
     }
@@ -97,7 +94,6 @@ pub const Library = struct {
         library.looks.deinit(gpa);
         library.calibrations.deinit();
         library.scanner_settings.deinit();
-        library.saved_details.deinit();
         gpa.free(library.path);
         if (library.home) |h| gpa.free(h);
         gpa.free(library.label);
@@ -137,7 +133,6 @@ pub const Library = struct {
     pub fn reload(library: *Library, gpa: std.mem.Allocator, io: std.Io) !void {
         // Read the new list first, so if that fails the old one is still good.
         const rolls = try roll.listRolls(gpa, io, library.path);
-        learnDetails(&library.saved_details, gpa, io, rolls.items);
         library.forgetThumbnails();
         for (library.rolls.items) |*r| r.close();
         library.rolls.deinit(gpa);
@@ -293,7 +288,9 @@ fn makeThumbnail(library: *Library, gpa: std.mem.Allocator, io: std.Io, gpu: *c.
         minilab.light_table.toScreen(scan.pixels, gain, pixels);
     } else {
         // A thumbnail is usually too small for dust to show, and then this leaves it as it is.
-        var cleaned = try settings.settings.withoutDust(gpa, scan, @max(scan.width, scan.height));
+        // The viewer, the loupe and thumbnails don't have the infrared plane yet, so infrared dust
+        // removal finds dust by its shape here (https://github.com/vdmkenny/minilab/issues/90).
+        var cleaned = try settings.settings.withoutDust(gpa, scan, null, @max(scan.width, scan.height));
         defer if (cleaned) |*s| s.deinit(gpa);
         var rendered = try minilab.look.render(gpa, cleaned orelse scan, settings.settings, try library.looks.resolve(gpa, io, settings.look));
         defer rendered.deinit(gpa);
@@ -315,11 +312,4 @@ test "the library's label has ~ for the home folder, and only for it" {
         defer gpa.free(label);
         try std.testing.expectEqualStrings(case.label, label);
     }
-}
-
-fn learnDetails(settings: *minilab.saved_details.Settings, gpa: std.mem.Allocator, io: std.Io, rolls: []const roll.Roll) void {
-    const infos = gpa.alloc(roll.Info, rolls.len) catch return;
-    defer gpa.free(infos);
-    for (infos, rolls) |*info, r| info.* = r.info;
-    settings.observe(io, infos) catch |err| std.log.warn("can't update saved roll details: {t}", .{err});
 }

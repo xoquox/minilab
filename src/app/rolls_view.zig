@@ -9,10 +9,14 @@ const theme = @import("../ui/theme.zig");
 const fonts = @import("../ui/fonts.zig");
 const labels = @import("labels.zig");
 const Library = @import("library.zig").Library;
-const saved_details = @import("saved_details.zig");
 const shortcuts = @import("shortcuts.zig");
 const holes = @import("holes.zig");
 const Dialog = @import("../platform/file_dialog.zig").Dialog;
+const account = @import("../platform/account.zig");
+const clock = @import("../platform/clock.zig");
+const roll_details = @import("roll_details.zig");
+const icons = @import("../ui/icons.zig");
+const i18n = @import("../i18n/i18n.zig");
 
 const roll = minilab.roll;
 const develop = minilab.develop;
@@ -53,9 +57,9 @@ const card_row_gap = 3;
 const card_bar_gap = 6;
 const card_bar = 3;
 const card_rounding = 6;
-/// The Delete button's distance from the card's corner, and its bin's half height.
-const delete_inset = 6;
-const bin_half = 7;
+/// The Edit and Delete buttons' distance from the card's corner, and the gap between them.
+const card_button_inset = 6;
+const card_button_gap = 2;
 /// The filmstrip: its gap from the card, the frame numbers under it, the corners of the film and
 /// the pictures, and the "+N more" box.
 const strip_gap = 12;
@@ -87,9 +91,11 @@ pub const State = struct {
     search: [gui.text_capacity:0]u8 = @splat(0),
     /// The film size shown, or null for all of them.
     size_filter: ?formats.FilmSize = null,
-    show_form: bool = false,
+    /// What the panel on the right shows, if anything.
+    panel: Panel = .closed,
     form: Form = .{},
-    saved: saved_details.State = .{},
+    /// The boxes for the details of the roll in the details panel.
+    details: roll_details.Boxes = .{},
     /// Move the keyboard focus to the search field on the next frame.
     focus_search: bool = false,
     /// The dialog for the new roll's flat field.
@@ -101,6 +107,41 @@ pub const State = struct {
     pub fn deinit(state: *State, gpa: std.mem.Allocator) void {
         state.flat_dialog.deinit(gpa);
         state.stopDeleting(gpa);
+        state.closePanel(gpa);
+    }
+
+    /// Opens the New roll panel with a fresh form, or closes it when it's already open.
+    pub fn toggleNewRoll(state: *State, gpa: std.mem.Allocator) void {
+        const was_open = state.panel == .new_roll;
+        state.closePanel(gpa);
+        if (!was_open) state.openNewRoll(gpa);
+    }
+
+    /// Opens the New roll panel with a fresh form.
+    pub fn openNewRoll(state: *State, gpa: std.mem.Allocator) void {
+        state.closePanel(gpa);
+        state.form = .{};
+        state.panel = .new_roll;
+    }
+
+    /// Opens the details panel for the roll in folder `path`.
+    fn showDetails(state: *State, gpa: std.mem.Allocator, path: []const u8) void {
+        const copy = gpa.dupe(u8, path) catch return;
+        state.closePanel(gpa);
+        state.details = .{};
+        state.panel = .{ .details = copy };
+    }
+
+    fn isShowingDetails(state: *const State, path: []const u8) bool {
+        return switch (state.panel) {
+            .details => |showing| std.mem.eql(u8, showing, path),
+            else => false,
+        };
+    }
+
+    pub fn closePanel(state: *State, gpa: std.mem.Allocator) void {
+        if (state.panel == .details) gpa.free(state.panel.details);
+        state.panel = .closed;
     }
 
     fn startDeleting(state: *State, gpa: std.mem.Allocator, path: []const u8) void {
@@ -120,6 +161,14 @@ pub const State = struct {
     }
 };
 
+/// What the panel on the right of the Rolls page shows.
+const Panel = union(enum) {
+    closed,
+    new_roll,
+    /// The details of the roll in this folder, to edit. It's kept by path, as Delete's roll is.
+    details: []u8,
+};
+
 /// The fields for the new roll.
 const Form = struct {
     name: [gui.text_capacity:0]u8 = @splat(0),
@@ -128,15 +177,18 @@ const Form = struct {
     stock: usize = 0,
     size: formats.FilmSize = .@"135",
     format: usize = 0,
-    camera: [minilab.saved_details.value_capacity:0]u8 = @splat(0),
-    lens: [minilab.saved_details.value_capacity:0]u8 = @splat(0),
-    copyright: [minilab.saved_details.value_capacity:0]u8 = @splat(0),
+    camera: [gui.text_capacity:0]u8 = @splat(0),
+    lens: [gui.text_capacity:0]u8 = @splat(0),
+    /// The day the roll was shot, as Export takes it: YYYY, YYYY-MM or YYYY-MM-DD.
+    shot: [gui.text_capacity:0]u8 = @splat(0),
+    copyright: [gui.text_capacity:0]u8 = @splat(0),
     notes: [gui.text_capacity * 4:0]u8 = @splat(0),
     input: roll.Input = .scanner,
     /// The flat field for a camera roll: a file with a shot of the light source and no film.
     flat: [path_field:0]u8 = @splat(0),
-    /// Whether the default name has been filled in since the form was last opened.
-    named: bool = false,
+    /// Whether the defaults (the next roll's name, today's date and the copyright) have been
+    /// filled in since the form was last opened.
+    filled: bool = false,
     /// Why the last click on Create didn't make the roll.
     problem: ?[]const u8 = null,
 };
@@ -158,7 +210,6 @@ pub const Created = struct {
     roll: usize,
     /// Set when the flat field given couldn't be used, so the roll has none.
     flat_failed: bool = false,
-    details_failed: bool = false,
 };
 
 const film_sizes = std.enums.values(formats.FilmSize);
@@ -181,13 +232,13 @@ pub fn draw(state: *State, library: *Library, gpa: std.mem.Allocator, io: std.Io
     var action: Action = .none;
     const available = c.ImGui_GetContentRegionAvail();
     const top = c.ImGui_GetCursorScreenPos();
-    const form = if (state.show_form) gui.px(form_width) else 0;
+    const form = if (state.panel == .closed) 0 else gui.px(form_width);
 
-    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_ChildBg, theme.page);
+    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_ChildBg, theme.colors.page);
     c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_WindowPadding, gui.vec2(gui.px(page_padding_x), gui.px(page_padding_y)));
     _ = c.ImGui_BeginChild("sheet", gui.vec2(available.x - form, available.y), c.ImGuiChildFlags_AlwaysUseWindowPadding, c.ImGuiWindowFlags_None);
     c.ImGui_PopStyleVar();
-    drawTitleRow(state, library);
+    drawTitleRow(state, library, gpa);
     c.ImGui_Dummy(gui.vec2(0, gui.px(title_gap) - c.ImGui_GetStyle().*.ItemSpacing.y * 2));
 
     var shown: usize = 0;
@@ -200,25 +251,32 @@ pub fn draw(state: *State, library: *Library, gpa: std.mem.Allocator, io: std.Io
         c.ImGui_Dummy(gui.vec2(0, gui.px(row_gap) - c.ImGui_GetStyle().*.ItemSpacing.y * 2));
     }
     if (library.rolls.items.len == 0) {
-        gui.paragraph(theme.text_tertiary, "No rolls yet");
+        const at = c.ImGui_GetCursorScreenPos();
+        c.ImGui_SetCursorScreenPos(gui.vec2(at.x, at.y + gui.emptySpool(c.ImGui_GetWindowDrawList(), at)));
+        gui.paragraph(theme.colors.text_tertiary, i18n.t.rolls.no_rolls);
     } else if (shown == 0) {
-        gui.paragraph(theme.text_tertiary, "No matching rolls");
+        gui.paragraph(theme.colors.text_tertiary, i18n.t.rolls.no_matching_rolls);
     }
     if (drawDeleteConfirmation(state, library, gpa)) |index| action = .{ .trash = index };
     c.ImGui_EndChild();
     c.ImGui_PopStyleColor();
 
-    if (state.show_form) {
+    if (state.panel != .closed) {
         c.ImGui_SetCursorScreenPos(gui.vec2(top.x + available.x - form, top.y));
         c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_WindowPadding, gui.vec2(gui.px(form_padding), gui.px(form_padding)));
-        _ = c.ImGui_BeginChild("new roll", gui.vec2(form, available.y), c.ImGuiChildFlags_AlwaysUseWindowPadding, c.ImGuiWindowFlags_None);
+        _ = c.ImGui_BeginChild("panel", gui.vec2(form, available.y), c.ImGuiChildFlags_AlwaysUseWindowPadding, c.ImGuiWindowFlags_None);
         c.ImGui_PopStyleVar();
         const window = c.ImGui_GetWindowPos();
-        c.ImDrawList_AddLine(c.ImGui_GetWindowDrawList(), window, gui.vec2(window.x, window.y + available.y), theme.imU32(theme.divider));
-        if (drawForm(state, library, gpa, io)) |created| action = .{ .created = created };
+        c.ImDrawList_AddLineV(c.ImGui_GetWindowDrawList(), window.x, window.y, window.y + available.y, theme.imU32(theme.colors.divider));
+        switch (state.panel) {
+            .closed => {},
+            .new_roll => if (drawForm(state, library, gpa, io)) |created| {
+                action = .{ .created = created };
+            },
+            .details => |path| drawDetails(state, library, gpa, io, path),
+        }
         c.ImGui_EndChild();
     }
-    saved_details.manager(&state.saved, &library.saved_details, io);
     return action;
 }
 
@@ -234,54 +292,55 @@ fn matches(state: *const State, info: roll.Info) bool {
 
 /// Draws the title row: "Rolls" and where the library is, then search, the film-size filter and
 /// New roll on the right.
-fn drawTitleRow(state: *State, library: *Library) void {
+fn drawTitleRow(state: *State, library: *Library, gpa: std.mem.Allocator) void {
     const row_top = c.ImGui_GetCursorPosY();
     const height = c.ImGui_GetFrameHeight();
     const right = c.ImGui_GetContentRegionAvail().x + c.ImGui_GetCursorPosX();
-    const new_label = "New roll";
+    const new_label = i18n.t.rolls.new_roll;
     fonts.push(.semibold);
     const new_width = c.ImGui_CalcTextSize(new_label).x + gui.px(2 * gui.button_padding + new_icon + new_icon_gap);
     fonts.pop();
-    const controls = gui.px(search_width + filter_width + 2 * title_row_gap) + new_width;
+    const controls = gui.px(search_width + gui.filter_icon_space + filter_width + 2 * title_row_gap) + new_width;
 
     fonts.pushSized(.semibold, fonts.page_title_size);
     const title_height = c.ImGui_GetFontSize();
     c.ImGui_SetCursorPosY(row_top + (height - title_height) / 2);
-    gui.text("Rolls");
+    gui.text(i18n.t.rolls.title);
     fonts.pop();
     c.ImGui_SameLineEx(0, gui.px(title_row_gap));
     c.ImGui_SetCursorPosY(row_top);
     c.ImGui_AlignTextToFramePadding();
-    const count = gui.print(" · {d} {s}", .{ library.rolls.items.len, if (library.rolls.items.len == 1) "roll" else "rolls" });
+    const rolls = library.rolls.items.len;
+    const count = gui.print(" · {s}", .{gui.say(if (rolls == 1) i18n.t.rolls.roll_count_one else i18n.t.rolls.roll_count_many, .{rolls})});
     const room = right - c.ImGui_GetCursorPosX() - controls - gui.px(count_gap) - c.ImGui_CalcTextSize(count).x;
-    gui.textColored(theme.text_tertiary, gui.print("{s}{s}", .{ gui.elideStart(library.label, room), count }));
+    gui.textColored(theme.colors.text_tertiary, gui.print("{s}{s}", .{ gui.elideStart(library.label, room), count }));
 
     c.ImGui_SameLineEx(right - controls, 0);
     if (state.focus_search) c.ImGui_SetKeyboardFocusHere();
     state.focus_search = false;
-    _ = gui.textField("search", &state.search, "Search name, stock, camera", search_width);
-    shortcuts.tooltip("Search rolls", .find);
+    _ = gui.textField("search", &state.search, i18n.t.rolls.search_hint, search_width);
+    shortcuts.tooltip(i18n.t.rolls.search_tooltip, .find);
     c.ImGui_SameLineEx(0, gui.px(title_row_gap));
     // All film sizes, then each size.
     var filter_names: [film_sizes.len + 1][]const u8 = undefined;
-    filter_names[0] = "All film sizes";
-    for (filter_names[1..], film_sizes) |*name, size| name.* = size.label();
+    filter_names[0] = i18n.t.rolls.all_film_sizes;
+    for (filter_names[1..], film_sizes) |*name, size| name.* = labels.filmSizeName(size);
     const filter_index = if (state.size_filter) |size| gui.indexIn(formats.FilmSize, film_sizes, size) + 1 else 0;
+    gui.filterIcon(height);
     if (gui.combo("film size", &filter_names, filter_index, filter_width)) |picked| {
         state.size_filter = if (picked == 0) null else film_sizes[picked - 1];
     }
     c.ImGui_SameLineEx(0, gui.px(title_row_gap));
     const corner = c.ImGui_GetCursorScreenPos();
     if (gui.buttonOf(.primary, "##new roll", gui.vec2(new_width / gui.scale, height / gui.scale))) {
-        state.show_form = !state.show_form;
-        state.form = .{};
+        state.toggleNewRoll(gpa);
     }
-    shortcuts.tooltip("New roll", .new_roll);
+    shortcuts.tooltip(new_label, .new_roll);
     // The plus sign, then the label: the button's padding in, the icon, then a gap.
     const list = c.ImGui_GetWindowDrawList();
-    gui.plus(list, gui.vec2(corner.x + gui.px(gui.button_padding + new_icon / 2), corner.y + height / 2), gui.px(new_plus_arm), gui.px(new_plus_thickness), theme.on_primary);
+    gui.plus(list, gui.vec2(corner.x + gui.px(gui.button_padding + new_icon / 2), corner.y + height / 2), gui.px(new_plus_arm), gui.px(new_plus_thickness), theme.colors.on_accent);
     fonts.push(.semibold);
-    c.ImDrawList_AddText(list, gui.vec2(corner.x + gui.px(gui.button_padding + new_icon + new_icon_gap), corner.y + (height - c.ImGui_GetTextLineHeight()) / 2), theme.imU32(theme.on_primary), new_label);
+    c.ImDrawList_AddText(list, gui.vec2(corner.x + gui.px(gui.button_padding + new_icon + new_icon_gap), corner.y + (height - c.ImGui_GetTextLineHeight()) / 2), theme.imU32(theme.colors.on_accent), new_label);
     fonts.pop();
 }
 
@@ -299,14 +358,14 @@ fn drawDeleteConfirmation(state: *State, library: *const Library, gpa: std.mem.A
         return null;
     }
     defer c.ImGui_EndPopup();
-    gui.title(gui.print("Delete {s}?", .{r.info.name}), fonts.title_size);
+    gui.title(gui.say(i18n.t.rolls.delete_title, .{r.info.name}), fonts.title_size);
     const frames = r.frames.items.len;
-    gui.textColored(theme.text_tertiary, gui.print("{d} {s}", .{ frames, if (frames == 1) "frame" else "frames" }));
+    gui.textColored(theme.colors.text_tertiary, gui.say(if (frames == 1) i18n.t.rolls.frame_count_one else i18n.t.rolls.frame_count_many, .{frames}));
     c.ImGui_Dummy(gui.vec2(0, gui.px(gui.dialog.gap)));
     var confirmed: ?usize = null;
-    if (gui.buttonOf(.primary, "Move to Trash", gui.vec2(0, gui.button_height))) confirmed = index;
+    if (gui.buttonOf(.primary, i18n.t.rolls.move_to_trash, gui.vec2(0, gui.button_height))) confirmed = index;
     c.ImGui_SameLineEx(0, gui.px(gui.dialog.gap));
-    const cancelled = gui.buttonOf(.normal, "Cancel", gui.vec2(0, gui.button_height)) or c.ImGui_IsKeyPressed(c.ImGuiKey_Escape);
+    const cancelled = gui.buttonOf(.normal, i18n.t.common.cancel, gui.vec2(0, gui.button_height)) or c.ImGui_IsKeyPressed(c.ImGuiKey_Escape);
     if (confirmed != null or cancelled) {
         state.stopDeleting(gpa);
         c.ImGui_CloseCurrentPopup();
@@ -314,8 +373,8 @@ fn drawDeleteConfirmation(state: *State, library: *const Library, gpa: std.mem.A
     return confirmed;
 }
 
-/// The Delete button on a roll's card: a small bin, shown while the card is hovered.
-const delete_size = 22;
+/// The Edit and Delete buttons on a roll's card, shown while the card is hovered.
+const card_button_size = 22;
 
 /// Draws one roll: its card, then its filmstrip.
 fn drawRow(state: *State, library: *Library, gpa: std.mem.Allocator, r: *roll.Roll, index: usize, drop: ?gui.Vec2) ?Action {
@@ -348,45 +407,55 @@ fn drawCard(state: *State, gpa: std.mem.Allocator, r: *roll.Roll, index: usize, 
     c.ImGui_SetNextItemAllowOverlap();
     if (c.ImGui_InvisibleButton("card", gui.vec2(gui.px(card_width), card_height), 0)) action = .{ .open = .{ .roll = index } };
     const hovered = c.ImGui_IsItemHovered(0);
-    c.ImDrawList_AddRectFilledEx(list, origin, gui.vec2(origin.x + gui.px(card_width), origin.y + card_height), theme.imU32(if (hovered) theme.control else theme.panel), gui.px(card_rounding), 0);
+    c.ImDrawList_AddRectFilledEx(list, origin, gui.vec2(origin.x + gui.px(card_width), origin.y + card_height), theme.imU32(if (hovered) theme.colors.control else theme.colors.panel), gui.px(card_rounding), 0);
     var at = gui.vec2(origin.x + gui.px(card_padding_x), origin.y + gui.px(card_padding_y));
     const inner = gui.px(card_width - 2 * card_padding_x);
     fonts.pushSized(.semibold, fonts.title_size);
-    c.ImDrawList_AddText(list, at, theme.imU32(theme.text), gui.elideEnd(r.info.name, inner));
+    c.ImDrawList_AddText(list, at, theme.imU32(theme.colors.text), gui.elideEnd(r.info.name, inner));
     fonts.pop();
     at.y += gui.px(card_title_line + card_row_gap);
     fonts.pushSized(.mono, fonts.small_size);
-    c.ImDrawList_AddText(list, at, theme.imU32(theme.accent), gui.print("{s}", .{r.info.shot orelse r.info.created orelse ""}));
+    c.ImDrawList_AddText(list, at, theme.imU32(theme.colors.accent), gui.print("{s}", .{r.info.shot orelse r.info.created orelse ""}));
     fonts.pop();
     at.y += gui.px(card_date_line + card_row_gap);
-    c.ImDrawList_AddText(list, at, theme.imU32(theme.text_secondary), gui.elideEnd(r.info.stock orelse labels.filmKind(r.info.kind), inner));
+    c.ImDrawList_AddText(list, at, theme.imU32(theme.colors.text_secondary), gui.elideEnd(r.info.stock orelse labels.filmKind(r.info.kind), inner));
     at.y += line + gui.px(card_row_gap);
-    c.ImDrawList_AddText(list, at, theme.imU32(theme.text_tertiary), gui.elideEnd(labels.filmAndFormat(r.info.format), inner));
+    c.ImDrawList_AddText(list, at, theme.imU32(theme.colors.text_tertiary), gui.elideEnd(labels.filmAndFormat(r.info.format), inner));
 
     const total = r.frames.items.len;
     const developed = r.developedCount();
     const bar_y = origin.y + card_height - gui.px(card_padding_y + card_bar);
-    c.ImDrawList_AddText(list, gui.vec2(at.x, bar_y - gui.px(card_row_gap) - line + (line - c.ImGui_GetTextLineHeight()) / 2), theme.imU32(theme.text_secondary), gui.print("{d} of {d} developed", .{ developed, total }));
+    c.ImDrawList_AddText(list, gui.vec2(at.x, bar_y - gui.px(card_row_gap) - line + (line - c.ImGui_GetTextLineHeight()) / 2), theme.imU32(theme.colors.text_secondary), gui.say(i18n.t.rolls.developed, .{ developed, total }));
     const bar_width = gui.px(card_width - 2 * card_padding_x);
     const share = if (total == 0) 0 else @as(f32, @floatFromInt(developed)) / @as(f32, @floatFromInt(total));
     gui.progressBar(list, gui.vec2(at.x, bar_y), gui.vec2(at.x + bar_width, bar_y + gui.px(card_bar)), share);
 
-    // Delete, in the card's top right corner while the mouse is over the card.
+    // Edit and Delete, in the card's top right corner while the mouse is over the card.
     const mouse = c.ImGui_GetMousePos();
     const over_card = mouse.x >= origin.x and mouse.x < origin.x + gui.px(card_width) and mouse.y >= origin.y and mouse.y < origin.y + card_height;
-    if (over_card or state.isDeleting(r.path)) {
-        const size = gui.px(delete_size);
-        const corner = gui.vec2(origin.x + gui.px(card_width - delete_inset) - size, origin.y + gui.px(delete_inset));
-        c.ImGui_SetCursorScreenPos(corner);
-        if (c.ImGui_InvisibleButton("delete", gui.vec2(size, size), 0)) state.startDeleting(gpa, r.path);
-        const on_button = c.ImGui_IsItemHovered(0);
-        if (on_button) {
-            gui.showTooltip("Delete roll");
-            c.ImDrawList_AddRectFilledEx(list, corner, gui.vec2(corner.x + size, corner.y + size), theme.imU32(theme.control_hover), gui.px(gui.choice_rounding), 0);
-        }
-        drawBin(list, gui.vec2(corner.x + size / 2, corner.y + size / 2), gui.px(bin_half), if (on_button) theme.red else theme.text_tertiary);
+    if (over_card or state.isDeleting(r.path) or state.isShowingDetails(r.path)) {
+        const size = gui.px(card_button_size);
+        const delete_corner = gui.vec2(origin.x + gui.px(card_width - card_button_inset) - size, origin.y + gui.px(card_button_inset));
+        if (cardButton(list, "delete", i18n.t.rolls.delete_roll, .trash, delete_corner, theme.red)) state.startDeleting(gpa, r.path);
+        const edit_corner = gui.vec2(delete_corner.x - size - gui.px(card_button_gap), delete_corner.y);
+        if (cardButton(list, "edit", i18n.t.rolls.edit_details, .pencil, edit_corner, theme.colors.text)) state.showDetails(gpa, r.path);
     }
     return action;
+}
+
+/// One of the small buttons on a card, at `corner`: `icon`, in `hover` while it's hovered.
+/// Returns true when it's clicked.
+fn cardButton(list: *c.ImDrawList, id: [:0]const u8, name: []const u8, icon: icons.Icon, corner: gui.Vec2, hover: theme.Color) bool {
+    const size = gui.px(card_button_size);
+    c.ImGui_SetCursorScreenPos(corner);
+    const clicked = c.ImGui_InvisibleButton(id, gui.vec2(size, size), 0);
+    const on_button = c.ImGui_IsItemHovered(0);
+    if (on_button) {
+        gui.showTooltip(name);
+        c.ImDrawList_AddRectFilledEx(list, corner, gui.vec2(corner.x + size, corner.y + size), theme.imU32(theme.colors.control_hover), gui.px(gui.choice_rounding), 0);
+    }
+    gui.drawIcon(icon, gui.vec2(corner.x + size / 2, corner.y + size / 2), if (on_button) hover else theme.colors.text_tertiary);
+    return clicked;
 }
 
 /// Draws roll `index`'s filmstrip beside its card, up to `right`, with "+N more" when the frames
@@ -408,7 +477,7 @@ fn drawStrip(library: *Library, gpa: std.mem.Allocator, r: *roll.Roll, index: us
     const strip_top = @round(origin.y);
     const thumbs_top = strip_top + @round((band - height) / 2);
     const width = @round(height * format.ratio());
-    const more_width = gui.px(2 * more_padding) + c.ImGui_CalcTextSize("+00 more").x;
+    const more_width = gui.px(2 * more_padding) + c.ImGui_CalcTextSize(gui.say(i18n.t.rolls.more_frames, .{"00"})).x;
     // Each frame takes its width and the gap after it; sheets each have their own border.
     const step = width + if (sheets) 2 * leader + gap else gap;
     const room = right - strip_x + gap - if (sheets) 0 else 2 * leader;
@@ -423,8 +492,8 @@ fn drawStrip(library: *Library, gpa: std.mem.Allocator, r: *roll.Roll, index: us
         // Punched in the page's colour, so they look cut out.
         switch (format.size.holes()) {
             .none => {},
-            .rows => |p| holes.rows(list, strip, p, strip_x + (p.pitch_mm - p.length_mm) * per_mm / 2, theme.page),
-            .per_frame => |count| for (0..shown) |i| holes.atFrame(list, strip, count, strip_x + leader + @as(f32, @floatFromInt(i)) * step, theme.page),
+            .rows => |p| holes.rows(list, strip, p, strip_x + (p.pitch_mm - p.length_mm) * per_mm / 2, theme.colors.page),
+            .per_frame => |count| for (0..shown) |i| holes.atFrame(list, strip, count, strip_x + leader + @as(f32, @floatFromInt(i)) * step, theme.colors.page),
         }
     }
 
@@ -446,12 +515,12 @@ fn drawStrip(library: *Library, gpa: std.mem.Allocator, r: *roll.Roll, index: us
         if (library.thumbnail(gpa, .{ .roll = index, .frame = frame })) |t| {
             gui.imageCover(list, t.ref(), t.width, t.height, corner, far, gui.px(thumb_rounding));
         } else {
-            c.ImDrawList_AddRectFilledEx(list, corner, far, theme.imU32(theme.control), gui.px(thumb_rounding), 0);
+            c.ImDrawList_AddRectFilledEx(list, corner, far, theme.imU32(theme.colors.control), gui.px(thumb_rounding), 0);
         }
         fonts.pushSized(.mono, fonts.caption_size);
         const number = labels.frameNumber(frame);
         const number_width = c.ImGui_CalcTextSize(number).x;
-        c.ImDrawList_AddText(list, gui.vec2(picture_x + (width - number_width) / 2, numbers_y), theme.imU32(theme.text_tertiary), number);
+        c.ImDrawList_AddText(list, gui.vec2(picture_x + (width - number_width) / 2, numbers_y), theme.imU32(theme.colors.text_tertiary), number);
         fonts.pop();
         x += step;
     }
@@ -459,79 +528,49 @@ fn drawStrip(library: *Library, gpa: std.mem.Allocator, r: *roll.Roll, index: us
         const corner = gui.vec2(strip_end + gui.px(thumb_gap), thumbs_top);
         c.ImGui_SetCursorScreenPos(corner);
         if (c.ImGui_InvisibleButton("more", gui.vec2(more_width, height), 0)) action = .{ .open = .{ .roll = index, .frame = shown } };
-        gui.dashedRect(list, corner, gui.vec2(corner.x + more_width, corner.y + height), theme.imU32(theme.border), 1, gui.px(more_dash), gui.px(more_dash_gap));
-        const more = gui.print("+{d} more", .{total - shown});
+        gui.dashedRect(list, corner, gui.vec2(corner.x + more_width, corner.y + height), theme.imU32(theme.colors.border), 1, gui.px(more_dash), gui.px(more_dash_gap));
+        const more = gui.say(i18n.t.rolls.more_frames, .{total - shown});
         const size = c.ImGui_CalcTextSize(more);
-        c.ImDrawList_AddText(list, gui.vec2(corner.x + (more_width - size.x) / 2, corner.y + (height - size.y) / 2), theme.imU32(theme.text_secondary), more);
+        c.ImDrawList_AddText(list, gui.vec2(corner.x + (more_width - size.x) / 2, corner.y + (height - size.y) / 2), theme.imU32(theme.colors.text_secondary), more);
     }
     if (total == 0) {
-        c.ImDrawList_AddText(list, gui.vec2(strip_x, thumbs_top + (height - c.ImGui_GetTextLineHeight()) / 2), theme.imU32(theme.text_tertiary), "No frames yet");
+        c.ImDrawList_AddText(list, gui.vec2(strip_x, thumbs_top + (height - c.ImGui_GetTextLineHeight()) / 2), theme.imU32(theme.colors.text_tertiary), i18n.t.common.no_frames_yet);
     }
     return action;
 }
 
-/// Draws a waste bin about `half` × 2 high, centred on `centre`: a lid with a handle, and a body
-/// with two lines down it.
-fn drawBin(list: *c.ImDrawList, centre: gui.Vec2, half: f32, colour: theme.Color) void {
-    const ink = theme.imU32(colour);
-    const thickness = gui.px(bin.thickness);
-    const top = centre.y - half;
-    const lid = top + half * bin.lid;
-    c.ImDrawList_AddLineEx(list, gui.vec2(centre.x - half, lid), gui.vec2(centre.x + half, lid), ink, thickness);
-    c.ImDrawList_AddRectEx(list, gui.vec2(centre.x - half * bin.handle, top), gui.vec2(centre.x + half * bin.handle, lid), ink, gui.px(bin.handle_rounding), thickness, 0);
-    const body_left = centre.x - half * bin.body;
-    const body_right = centre.x + half * bin.body;
-    const bottom = centre.y + half;
-    c.ImDrawList_AddRectEx(list, gui.vec2(body_left, lid), gui.vec2(body_right, bottom), ink, gui.px(bin.body_rounding), thickness, 0);
-    for ([_]f32{ -bin.lines, bin.lines }) |at| {
-        const x = centre.x + half * at;
-        c.ImDrawList_AddLineEx(list, gui.vec2(x, lid + half * bin.lid), gui.vec2(x, bottom - half * bin.line_end), ink, thickness);
-    }
-}
-
-/// The bin's drawing, as shares of its half height: the lid's height, the handle's and the
-/// body's half widths, where the lines down the body are, and how far above the bottom they end.
-/// Then its stroke and corners, in the design's pixels.
-const bin = struct {
-    const lid = 0.35;
-    const handle = 0.3;
-    const body = 0.75;
-    const lines = 0.28;
-    const line_end = 0.3;
-    const thickness = 1.4;
-    const handle_rounding = 1;
-    const body_rounding = 1.5;
-};
-
 /// Draws the new-roll panel. Returns the new roll's index once it's made.
 fn drawForm(state: *State, library: *Library, gpa: std.mem.Allocator, io: std.Io) ?Created {
     const form = &state.form;
-    if (!form.named) {
-        _ = std.fmt.bufPrintSentinel(&form.name, "Roll {d:0>3}", .{library.rolls.items.len + 1}, 0) catch {};
-        form.named = true;
+    if (!form.filled) {
+        gui.setText(&form.name, gui.say(i18n.t.rolls.default_name, .{gui.print("{d:0>3}", .{library.rolls.items.len + 1})})) catch {};
+        var today: [minilab.date.max_text]u8 = undefined;
+        gui.setText(&form.shot, clock.today(io).format(&today)) catch {};
+        fillCopyright(form, library);
+        form.filled = true;
     }
 
-    drawFormTitle(state);
+    drawPanelTitle(state, gpa, i18n.t.rolls.new_roll);
 
     c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_ItemSpacing, gui.vec2(gui.px(form_spacing), gui.px(form_spacing)));
     defer c.ImGui_PopStyleVar();
-    gui.rowLabel("Name");
+    gui.rowLabel(i18n.t.rolls.name);
     if (gui.textField("name", &form.name, "", 0)) form.problem = null;
     if (form.problem) |problem| {
         gui.rowLabel("");
-        gui.paragraph(theme.text_tertiary, problem);
+        gui.paragraph(theme.colors.text_tertiary, problem);
     }
-    gui.rowLabel("Film type");
+    gui.rowLabel(i18n.t.rolls.film_type);
     if (gui.comboOf(develop.FilmKind, "film type", &labels.film_kinds, form.kind, labels.filmKind, 0)) |picked| {
         form.kind = picked;
         form.stock = 0;
     }
-    gui.rowLabel("Stock");
+    gui.rowLabel(i18n.t.rolls.stock);
     var stock_buffer: [labels.stock_choices.len + 1][]const u8 = undefined;
-    const stock_names = labels.stockNames(form.kind, "Other", &stock_buffer);
+    const stock_names = labels.stockNames(form.kind, i18n.t.common.other, &stock_buffer);
     if (form.stock >= stock_names.len) form.stock = 0;
-    if (gui.searchCombo("stock", stock_names, form.stock, 0, "Search stocks")) |picked| form.stock = picked;
-    gui.rowLabel("Film size");
+    if (gui.searchCombo("stock", stock_names, form.stock, 0, i18n.t.rolls.search_stocks)) |picked| form.stock = picked;
+    gui.rowLabel(i18n.t.rolls.film_size);
     if (gui.comboOf(formats.FilmSize, "film size", film_sizes, form.size, labels.filmSizeChoice, 0)) |picked| {
         form.size = picked;
         form.format = 0;
@@ -540,22 +579,23 @@ fn drawForm(state: *State, library: *Library, gpa: std.mem.Allocator, io: std.Io
     const choices = formatsOf(form.size, &buffer);
     var names: [buffer.len][]const u8 = undefined;
     for (choices, 0..) |id, i| names[i] = labels.format(id);
-    gui.rowLabel("Format");
+    gui.rowLabel(i18n.t.rolls.format);
     if (gui.combo("format", names[0..choices.len], form.format, 0)) |picked| form.format = picked;
-    gui.rowLabel("Camera");
-    _ = saved_details.field(&state.saved, &library.saved_details, .camera, "camera", &form.camera, "[Camera]", 0);
-    gui.rowLabel("Lens");
-    _ = saved_details.field(&state.saved, &library.saved_details, .lens, "lens", &form.lens, "[Lens]", 0);
-    gui.rowLabel("Copyright");
-    _ = saved_details.field(&state.saved, &library.saved_details, .copyright, "copyright", &form.copyright, "[Your name]", 0);
-    gui.rowLabel("");
-    if (gui.buttonOf(.quiet, "Saved entries...", gui.vec2(0, 0))) state.saved.manage(state.saved.kind);
+    for ([_]struct { roll.Detail, [:0]u8, [:0]const u8 }{
+        .{ .camera, &form.camera, i18n.t.rolls.camera_hint },
+        .{ .lens, &form.lens, i18n.t.rolls.lens_hint },
+        .{ .shot, &form.shot, i18n.t.rolls.date_hint },
+        .{ .copyright, &form.copyright, i18n.t.rolls.copyright_hint },
+    }) |row| {
+        gui.rowLabel(roll_details.label(row[0]));
+        _ = roll_details.field(row[0], row[1], row[2], 0, library, io);
+    }
     const notes_x = c.ImGui_GetCursorPosX();
-    gui.textColored(theme.text_secondary, "Notes");
+    gui.textColored(theme.colors.text_secondary, roll_details.label(.notes));
     c.ImGui_SameLineEx(notes_x + gui.px(gui.label_column + gui.label_gap), 0);
     _ = c.ImGui_InputTextMultilineEx("##notes", &form.notes, form.notes.len + 1, gui.vec2(-std.math.floatMin(f32), gui.lineHeight() * notes_lines + gui.px(notes_padding)), 0, null, null);
-    gui.rowLabel("Input");
-    if (gui.comboOf(roll.Input, "input", &form_inputs, form.input, roll.Input.label, 0)) |picked| form.input = picked;
+    gui.rowLabel(i18n.t.rolls.input);
+    if (gui.comboOf(roll.Input, "input", &form_inputs, form.input, labels.input, 0)) |picked| form.input = picked;
     if (form.input == .camera_raw) drawFlatField(state, gpa, io);
 
     // The button sits at the bottom of the panel.
@@ -565,22 +605,22 @@ fn drawForm(state: *State, library: *Library, gpa: std.mem.Allocator, io: std.Io
     c.ImGui_BeginDisabled(name.len == 0 or choices.len == 0);
     defer c.ImGui_EndDisabled();
     if (!gui.buttonOf(.primary, switch (form.input) {
-        .scanner => "Create roll and scan",
-        .camera_raw, .tiff_files, .finished => "Create roll",
+        .scanner => i18n.t.rolls.create_and_scan,
+        .camera_raw, .tiff_files, .finished => i18n.t.rolls.create,
     }, gui.vec2(c.ImGui_GetContentRegionAvail().x / gui.scale, create_height))) return null;
     return createRoll(state, library, gpa, io, stock_names, choices);
 }
 
-/// Draws the panel's title and its close button.
-fn drawFormTitle(state: *State) void {
+/// Draws the panel's title, `title`, with its close button.
+fn drawPanelTitle(state: *State, gpa: std.mem.Allocator, title: []const u8) void {
     const close_size = c.ImGui_GetFrameHeight();
     c.ImGui_AlignTextToFramePadding();
-    gui.title("New roll", fonts.title_size);
+    gui.title(title, fonts.title_size);
     c.ImGui_SameLineEx(c.ImGui_GetContentRegionAvail().x + c.ImGui_GetCursorPosX() - close_size - c.ImGui_GetStyle().*.ItemSpacing.x, 0);
     const corner = c.ImGui_GetCursorScreenPos();
-    if (gui.buttonOf(.quiet, "##close", gui.vec2(close_size / gui.scale, close_size / gui.scale))) state.show_form = false;
+    if (gui.buttonOf(.quiet, "##close", gui.vec2(close_size / gui.scale, close_size / gui.scale))) state.closePanel(gpa);
     const centre = gui.vec2(corner.x + close_size / 2, corner.y + close_size / 2);
-    gui.cross(c.ImGui_GetWindowDrawList(), centre, gui.px(close_arm), gui.px(close_thickness), theme.text_secondary);
+    gui.cross(c.ImGui_GetWindowDrawList(), centre, gui.px(close_arm), gui.px(close_thickness), theme.colors.text_secondary);
 }
 
 /// Draws the flat field row, for a camera roll: a button that picks the shot, which is optional.
@@ -592,15 +632,15 @@ fn drawFlatField(state: *State, gpa: std.mem.Allocator, io: std.Io) void {
         const path = chosen[chosen.len - 1];
         gui.setText(&form.flat, path) catch std.log.err("the flat field's path is too long: {s}", .{path});
     }
-    gui.rowLabel("Flat field");
+    gui.rowLabel(i18n.t.rolls.flat_field);
     const flat = std.mem.sliceTo(&form.flat, 0);
     const width = c.ImGui_GetContentRegionAvail().x;
-    const label = if (flat.len == 0) "Choose a shot…" else gui.elideStart(std.fs.path.basename(flat), width - c.ImGui_GetStyle().*.FramePadding.x * 2);
+    const label = if (flat.len == 0) i18n.t.rolls.choose_shot else gui.elideStart(std.fs.path.basename(flat), width - c.ImGui_GetStyle().*.FramePadding.x * 2);
     c.ImGui_PushID("flat field");
     if (gui.buttonOf(.normal, label, gui.vec2(width / gui.scale, 0))) state.flat_dialog.show(gpa, io);
     c.ImGui_PopID();
     c.ImGui_SetCursorPosX(c.ImGui_GetCursorPosX() + gui.px(gui.label_column + gui.label_gap));
-    gui.paragraph(theme.text_tertiary, "Optional");
+    gui.paragraph(theme.colors.text_tertiary, i18n.t.rolls.optional);
 }
 
 /// Makes the roll the form describes, with `stock_names` and `choices` as the form listed them.
@@ -617,21 +657,17 @@ fn createRoll(state: *State, library: *Library, gpa: std.mem.Allocator, io: std.
         .input = form.input,
         .camera = optional(&form.camera),
         .lens = optional(&form.lens),
+        .shot = optional(&form.shot),
         .copyright = optional(&form.copyright),
         .notes = optional(&form.notes),
     }) catch |err| {
         std.log.err("can't make the roll: {t}", .{err});
         form.problem = switch (err) {
-            error.RollExists => "Name already used",
-            error.BadRollName => "Invalid name",
-            else => "Roll not created",
+            error.RollExists => i18n.t.rolls.name_used,
+            error.BadRollName => i18n.t.rolls.invalid_name,
+            else => i18n.t.rolls.not_created,
         };
         return null;
-    };
-    var details_failed = false;
-    library.saved_details.rememberInfo(io, made.info) catch |err| {
-        std.log.warn("roll created, but saved details were not updated: {t}", .{err});
-        details_failed = true;
     };
     const flat = std.mem.sliceTo(&form.flat, 0);
     var flat_failed = false;
@@ -644,14 +680,37 @@ fn createRoll(state: *State, library: *Library, gpa: std.mem.Allocator, io: std.
     made.close();
     // The roll is made either way, so the form is done: leaving it open would only say the name
     // is taken next time.
-    state.show_form = false;
+    state.closePanel(gpa);
     state.form = .{};
     // If the library can't be read now, the roll shows up when it's next read.
     library.reload(gpa, io) catch |err| {
         std.log.err("can't read the library again: {t}", .{err});
         return null;
     };
-    return .{ .roll = library.find(path) orelse return null, .flat_failed = flat_failed, .details_failed = details_failed };
+    return .{ .roll = library.find(path) orelse return null, .flat_failed = flat_failed };
+}
+
+/// Starts the copyright as the newest roll's, or before any roll has one, as the account's full
+/// name. It's usually the same on every roll.
+fn fillCopyright(form: *Form, library: *const Library) void {
+    var name_buffer: [gui.text_capacity]u8 = undefined;
+    const used = library.suggestions(.copyright);
+    const copyright = if (used.len > 0) used[0] else account.fullName(&name_buffer) orelse return;
+    gui.setText(&form.copyright, copyright) catch {};
+}
+
+/// Draws the details panel for the roll in folder `path`: its details, each saved when you leave
+/// its box. It closes if the roll has gone.
+fn drawDetails(state: *State, library: *Library, gpa: std.mem.Allocator, io: std.Io, path: []const u8) void {
+    const index = library.find(path) orelse return state.closePanel(gpa);
+    const r = &library.rolls.items[index];
+    drawPanelTitle(state, gpa, r.info.name);
+    c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_ItemSpacing, gui.vec2(gui.px(form_spacing), gui.px(form_spacing)));
+    defer c.ImGui_PopStyleVar();
+    for (std.enums.values(roll.Detail)) |which| {
+        gui.rowLabel(roll_details.label(which));
+        state.details.draw(which, r, library, io, i18n.t.common.not_set, 0);
+    }
 }
 
 /// Sets the shot in the file at `path` as the flat field of roll `r`.
@@ -664,59 +723,4 @@ fn setFlatField(gpa: std.mem.Allocator, io: std.Io, r: *roll.Roll, path: []const
 fn optional(buffer: anytype) ?[]const u8 {
     const text = std.mem.sliceTo(buffer, 0);
     return if (text.len == 0) null else text;
-}
-
-test "new rolls remember their details and removed suggestions stay hidden on refresh" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const folder = try tmp.dir.realPathFileAlloc(io, ".", gpa);
-    defer gpa.free(folder);
-    var library = try Library.load(gpa, io, folder, null);
-    // No textures are created, so deinit never uses a GPU.
-    defer library.deinit(gpa, undefined);
-    var state: State = .{};
-    defer state.deinit(gpa);
-    state.form.name = gui.initText(gui.text_capacity, "First");
-    state.form.camera = gui.initText(minilab.saved_details.value_capacity, "Nikon F3");
-    state.form.lens = gui.initText(minilab.saved_details.value_capacity, "50 mm");
-    state.form.copyright = gui.initText(minilab.saved_details.value_capacity, "Ada");
-    state.form.input = .tiff_files;
-    const made = createRoll(&state, &library, gpa, io, &.{"Other"}, &.{.@"135_full_frame"}).?;
-    try std.testing.expect(!made.details_failed);
-    try std.testing.expectEqual(@as(usize, 1), library.saved_details.count(.camera));
-    try std.testing.expectEqual(@as(usize, 1), library.saved_details.count(.lens));
-    try std.testing.expectEqual(@as(usize, 1), library.saved_details.count(.copyright));
-    try library.saved_details.forget(io, .camera, "Nikon F3");
-    try library.reload(gpa, io);
-    try std.testing.expectEqual(@as(usize, 0), library.saved_details.count(.camera));
-    try std.testing.expectEqualStrings("Nikon F3", library.rolls.items[0].info.camera.?);
-    state.form.name = gui.initText(gui.text_capacity, "Second");
-    state.form.camera = gui.initText(minilab.saved_details.value_capacity, "Nikon F3");
-    state.form.input = .tiff_files;
-    _ = createRoll(&state, &library, gpa, io, &.{"Other"}, &.{.@"135_full_frame"}).?;
-    try std.testing.expectEqual(@as(usize, 1), library.saved_details.count(.camera));
-}
-
-test "a saved-entry failure does not lose the roll or its metadata" {
-    std.testing.log_level = .err;
-    defer std.testing.log_level = .warn;
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const folder = try tmp.dir.realPathFileAlloc(io, ".", gpa);
-    defer gpa.free(folder);
-    var library = try Library.load(gpa, io, folder, null);
-    defer library.deinit(gpa, undefined);
-    library.saved_details.readable = false;
-    var state: State = .{};
-    defer state.deinit(gpa);
-    state.form.name = gui.initText(gui.text_capacity, "Kept");
-    state.form.copyright = gui.initText(minilab.saved_details.value_capacity, "Ada");
-    state.form.input = .tiff_files;
-    const made = createRoll(&state, &library, gpa, io, &.{"Other"}, &.{.@"135_full_frame"}).?;
-    try std.testing.expect(made.details_failed);
-    try std.testing.expectEqualStrings("Ada", library.rolls.items[made.roll].info.copyright.?);
 }

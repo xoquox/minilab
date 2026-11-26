@@ -31,12 +31,14 @@ const context = @import("context.zig");
 const shortcuts = @import("shortcuts.zig");
 const holes = @import("holes.zig");
 const labels = @import("labels.zig");
+const i18n = @import("../i18n/i18n.zig");
 const Texture = @import("../platform/texture.zig").Texture;
 const scan_worker = @import("scan_worker.zig");
 const scan = scan_worker.scan;
 const Worker = scan_worker.Worker;
 
 const image = minilab.image;
+const Preferences = minilab.preferences.Preferences;
 const frames = minilab.frames;
 const formats = minilab.formats;
 const roll = minilab.roll;
@@ -70,9 +72,6 @@ const queue_row_padding_x = 10;
 const progress_height = 6;
 const cancel_height = 34;
 const number_column = 20;
-/// The scanner settings window: its option names' column and its drop-downs.
-const setting_label_width = 150;
-const setting_value_width = 260;
 /// The most values one scanner setting offers.
 const max_setting_values = 64;
 const frame_view_height = 200;
@@ -148,10 +147,6 @@ const strip_gap_mm = 4;
 const min_box_px = 8;
 
 const mm_per_inch = formats.mm_per_inch;
-/// The resolution previews are scanned at, or the scanner's next one up.
-const preview_dpi = 300;
-/// The resolution picked to start with, or the scanner's closest one.
-const default_dpi = 2400;
 /// The most resolutions the menu lists. A driver that lists more gets its highest ones.
 const max_resolutions = 32;
 /// The frame view shows this share of the frame's length past each end, as in the design.
@@ -174,19 +169,11 @@ const FilmType = enum {
     positive,
 
     fn label(film: FilmType) [:0]const u8 {
-        return switch (film) {
-            .colour_negative => "Color negative",
-            .bw_negative => "B&W negative",
-            .positive => "Positive",
-        };
+        return i18n.label(i18n.t.scan.film_types, film);
     }
 
     fn why(film: FilmType) []const u8 {
-        return switch (film) {
-            .colour_negative => "raw, orange mask kept",
-            .bw_negative => "raw, inverted in minilab",
-            .positive => "no inversion",
-        };
+        return i18n.label(i18n.t.scan.film_types_why, film);
     }
 
     fn detectKind(film: FilmType) frames.Kind {
@@ -483,8 +470,8 @@ pub const State = struct {
     /// The device that's open or being opened.
     device: ?usize = null,
     capabilities: ?scan.Capabilities = null,
-    /// The last failure, for the panel. It's a static string.
-    problem: ?[]const u8 = null,
+    /// The last failure, for the panel.
+    problem: ?Problem = null,
 
     film: FilmType = .colour_negative,
     /// How positives sit in the holder: as a strip, or as mounted slides. Negatives are always
@@ -492,7 +479,9 @@ pub const State = struct {
     holder_choice: frames.Holder = .strip,
     /// How detected frames fit their pictures.
     fit: frames.Fit = .format,
-    dpi: u32 = default_dpi,
+    /// The resolution to scan at. It starts at the preferences' (`devices` sets it), or the
+    /// scanner's closest one.
+    dpi: u32 = (Preferences{}).scan_dpi,
     dpi_y: ?u32 = null,
     infrared: bool = false,
     margin_mm: f32 = 1.0,
@@ -507,8 +496,8 @@ pub const State = struct {
     preview: ?Preview = null,
     boxes: std.ArrayList(Box) = .empty,
     selected: ?usize = null,
-    /// Why the last detection found nothing. It's a static string.
-    detect_note: ?[]const u8 = null,
+    /// Why the last detection found nothing.
+    detect_note: ?DetectNote = null,
     /// Whether the boxes have changed since they were saved.
     boxes_dirty: bool = false,
     drag: ?Drag = null,
@@ -520,8 +509,8 @@ pub const State = struct {
     /// the scanner.
     queue_turns: u2 = 0,
     scanning: bool = false,
-    /// Whether the scanner settings window is open.
-    settings_open: bool = false,
+    /// Set when the panel asks for Settings to open on its Scanner page. The app opens it.
+    open_settings: bool = false,
 
     pub fn deinit(state: *State, gpa: std.mem.Allocator, gpu: *c.SDL_GPUDevice) void {
         if (state.worker) |w| w.stop();
@@ -551,7 +540,7 @@ pub const State = struct {
         if (state.worker != null) return;
         state.worker = Worker.start(gpa, io) catch |err| {
             std.log.err("can't start the scan thread: {t}", .{err});
-            state.problem = "Scan thread failed to start";
+            state.problem = .start;
             return;
         };
     }
@@ -574,26 +563,52 @@ pub const State = struct {
     }
 };
 
-var status_buffer: [128]u8 = undefined;
+/// Why the scanner can't be used, for the panel and a notice.
+const Problem = enum {
+    /// The scan thread didn't start.
+    start,
+    list,
+    open,
+    preview,
+    scan,
+
+    fn text(problem: Problem) [:0]const u8 {
+        return i18n.label(i18n.t.scan.problems, problem);
+    }
+};
+
+/// Why detection found no frames.
+const DetectNote = enum {
+    no_opening,
+    bad_resolution,
+    out_of_memory,
+    none_found,
+
+    fn text(note: DetectNote) [:0]const u8 {
+        return i18n.label(i18n.t.scan.detect_notes, note);
+    }
+};
+
+/// What the open scanner is doing, for the header.
+const Doing = enum { opening, not_ready, ready, previewing, scanning, finishing };
 
 /// The header's scanner line: "Perfection V200 · ready", or "No scanner". `ready` is true when a
-/// scanner is open and idle.
+/// scanner is open and idle. The line lasts for this frame.
 pub fn status(state: *const State) struct { text: []const u8, ready: bool } {
-    const worker = state.worker orelse return .{ .text = "No scanner", .ready = false };
+    const worker = state.worker orelse return .{ .text = i18n.t.scan.no_scanner, .ready = false };
     const name = state.deviceName() orelse return switch (worker.phase.load(.acquire)) {
-        .loading, .listing => .{ .text = "Looking for scanners", .ready = false },
-        else => .{ .text = "No scanner", .ready = false },
+        .loading, .listing => .{ .text = i18n.t.scan.looking_for_scanners, .ready = false },
+        else => .{ .text = i18n.t.scan.no_scanner, .ready = false },
     };
-    const doing: []const u8 = switch (worker.phase.load(.acquire)) {
-        .loading, .listing, .opening => "opening",
-        .idle => if (state.capabilities == null) "not ready" else "ready",
-        .previewing => "previewing",
-        .scanning => "scanning",
-        .finishing => "finishing",
-        .unavailable => "not ready",
+    const doing: Doing = switch (worker.phase.load(.acquire)) {
+        .loading, .listing, .opening => .opening,
+        .idle => if (state.capabilities == null) .not_ready else .ready,
+        .previewing => .previewing,
+        .scanning => .scanning,
+        .finishing => .finishing,
+        .unavailable => .not_ready,
     };
-    const text = std.fmt.bufPrint(&status_buffer, "{s} · {s}", .{ name, doing }) catch name;
-    return .{ .text = text, .ready = std.mem.eql(u8, doing, "ready") };
+    return .{ .text = gui.print("{s} · {s}", .{ name, i18n.label(i18n.t.scan.doing, doing) }), .ready = doing == .ready };
 }
 
 /// Picks up what the scan thread has done, and adds scanned frames to their roll. `draw` does
@@ -617,10 +632,13 @@ fn handleEvent(state: *State, ctx: context.Context, worker: *Worker, event: *sca
             state.device = null;
             if (state.capabilities) |*caps| caps.deinit(gpa);
             state.capabilities = null;
-            // Open the first scanner straight away, since there's usually only one.
+            // Open a scanner straight away: the one picked last, or else the first, since
+            // there's usually only one.
             if (list.len > 0) {
-                state.device = 0;
-                worker.submit(.{ .open = 0 }) catch {};
+                const index = remembered(list, ctx.preferences.values.scanner) orelse 0;
+                state.device = index;
+                state.dpi = ctx.preferences.values.scan_dpi;
+                worker.submit(.{ .open = index }) catch {};
             }
             return;
         },
@@ -629,7 +647,7 @@ fn handleEvent(state: *State, ctx: context.Context, worker: *Worker, event: *sca
             state.capabilities = opened.capabilities;
             state.device = opened.device;
             state.problem = null;
-            state.dpi = chooseDpi(opened.capabilities, state.dpi);
+            state.dpi = chooseDpi(opened.capabilities, state.dpi, ctx.preferences.values.scan_dpi);
             state.dpi_y = null;
             sendRaw(state, ctx);
             return;
@@ -642,20 +660,21 @@ fn handleEvent(state: *State, ctx: context.Context, worker: *Worker, event: *sca
             state.capabilities = reopened.capabilities;
             state.device = reopened.device;
             state.problem = null;
-            if (state.dpi_y == null) state.dpi = chooseDpi(reopened.capabilities, state.dpi);
+            validateDpi(state, reopened.capabilities, ctx.preferences.values.scan_dpi);
             return;
         },
         .failed => |failed| {
             std.log.err("scanner {t}: {t}", .{ failed.stage, failed.err });
             // Without drivers, the scanner panel already says what to install.
             if (failed.err == error.Unavailable) return;
-            state.problem = switch (failed.stage) {
-                .list => "Scanner search failed",
-                .open => "Can't open scanner · busy or in use elsewhere",
-                .preview => "Preview failed",
-                .scan => "Scan failed",
+            const problem: Problem = switch (failed.stage) {
+                .list => .list,
+                .open => .open,
+                .preview => .preview,
+                .scan => .scan,
             };
-            ctx.notice.set("{s}", .{state.problem.?});
+            state.problem = problem;
+            ctx.notice.set("{s}", .{problem.text()});
             if (failed.stage == .open) state.device = null;
         },
         .preview => |*picture| {
@@ -697,7 +716,7 @@ fn handleEvent(state: *State, ctx: context.Context, worker: *Worker, event: *sca
         .queue_done => |done| {
             state.scanning = false;
             if (done.cancelled) {
-                ctx.notice.set("Scanning canceled", .{});
+                ctx.notice.set("{s}", .{i18n.t.scan.scanning_canceled});
             } else {
                 var added: usize = 0;
                 var wanted: usize = 0;
@@ -705,7 +724,7 @@ fn handleEvent(state: *State, ctx: context.Context, worker: *Worker, event: *sca
                     added += @intFromBool(item.frame() != null);
                     wanted += @intFromBool(item != .skipped);
                 }
-                ctx.notice.set("Scanned {d} of {d} frames", .{ added, wanted });
+                ctx.notice.set("{s}", .{gui.say(i18n.t.scan.scanned_frames, .{ added, wanted })});
             }
         },
     }
@@ -718,10 +737,25 @@ fn queueItem(state: *State, index: usize) ?*QueueItem {
 }
 
 /// The resolution to use after the scanner changes: the chosen one if the scanner has it, or else
-/// the one closest to the default.
-fn chooseDpi(capabilities: scan.Capabilities, current: u32) u32 {
+/// the one closest to the preferences' `wanted`.
+fn chooseDpi(capabilities: scan.Capabilities, current: u32, wanted: u32) u32 {
     if (std.mem.indexOfScalar(u32, capabilities.resolutions, current) != null) return current;
-    return capabilities.resolutionNearest(default_dpi) orelse current;
+    return capabilities.resolutionNearest(wanted) orelse current;
+}
+
+/// Keep a native pair only while both axes remain available for the new source.
+fn validateDpi(state: *State, capabilities: scan.Capabilities, wanted: u32) void {
+    if (state.infrared and capabilities.infrared) {
+        state.dpi_y = null;
+        if (std.mem.indexOfScalar(u32, &minilab.scan.sane_ir.resolutions, state.dpi) == null) state.dpi = 3200;
+        return;
+    }
+    if (!capabilities.infrared) state.infrared = false;
+    if (state.dpi_y) |vertical| {
+        if (capabilities.hasAxisResolution(.{ state.dpi, vertical })) return;
+        state.dpi_y = null;
+    }
+    state.dpi = chooseDpi(capabilities, state.dpi, wanted);
 }
 
 /// Adds a scanned frame to the queue's roll. Returns its index there.
@@ -729,20 +763,9 @@ fn addToRoll(state: *State, ctx: context.Context, done: scan_worker.Scanned) !us
     const path = state.queue_roll orelse return error.NoRoll;
     const index = ctx.library.find(path) orelse return error.RollNotFound;
     const r = &ctx.library.rolls.items[index];
-    const frame = try r.addScanAt(ctx.gpa, ctx.io, done.ppm, done.dpi);
-    const saved = &r.frames.items[frame];
-    if (done.native_tiff) |bytes| {
-        const name = try std.fmt.allocPrint(r.arena.allocator(), "{s}.native.tiff", .{saved.scan.?});
-        const native_path = try std.fs.path.join(ctx.gpa, &.{ r.path, minilab.roll.scans_dir, name });
-        defer ctx.gpa.free(native_path);
-        try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = native_path, .data = bytes });
-        saved.native_scan = name;
-        saved.capture_dpi = done.capture_dpi;
-    }
-    if (done.infrared_pgm) |ir| try r.attachInfrared(ctx.gpa, ctx.io, frame, done.corrected_tiff, ir, done.infrared_pixels);
-    saved.crop = done.crop;
-    saved.quarter_turns = state.queue_turns;
-    try r.saveFrame(ctx.io, frame);
+    const stored = try storeFrame(r, ctx.gpa, ctx.io, done, state.queue_turns);
+    const frame = stored.frame;
+    if (stored.native_failed) ctx.notice.say(i18n.t.scan.native_save_failed, .{});
     if (r.info.dpi == null or r.info.scanner == null) {
         r.info.dpi = done.dpi;
         if (r.info.scanner == null) if (state.openDevice()) |device| {
@@ -751,6 +774,32 @@ fn addToRoll(state: *State, ctx: context.Context, done: scan_worker.Scanned) !us
         r.saveInfo(ctx.io) catch |err| std.log.err("can't save the roll: {t}", .{err});
     }
     return frame;
+}
+
+const StoredFrame = struct { frame: usize, native_failed: bool };
+
+/// Archive failures must not leave a working frame without its crop and turns.
+fn storeFrame(r: *roll.Roll, gpa: std.mem.Allocator, io: std.Io, done: scan_worker.Scanned, turns: u2) !StoredFrame {
+    const frame = try r.addScanAt(gpa, io, done.ppm, done.dpi);
+    const saved = &r.frames.items[frame];
+    var native_failed = false;
+    if (done.native_tiff) |bytes| {
+        const name = try std.fmt.allocPrint(r.arena.allocator(), "{s}.native.tiff", .{saved.scan.?});
+        const path = try std.fs.path.join(gpa, &.{ r.path, minilab.roll.scans_dir, name });
+        defer gpa.free(path);
+        if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes })) |_| {
+            saved.native_scan = name;
+            saved.capture_dpi = done.capture_dpi;
+        } else |err| {
+            std.log.warn("working scan kept, but native TIFF could not be saved: {t}", .{err});
+            native_failed = true;
+        }
+    }
+    if (done.infrared_pgm) |ir| try r.attachInfrared(gpa, io, frame, done.corrected_tiff, ir, done.infrared_pixels);
+    saved.crop = done.crop;
+    saved.quarter_turns = turns;
+    try r.saveFrame(io, frame);
+    return .{ .frame = frame, .native_failed = native_failed };
 }
 
 /// Draws the workspace. Returns a workspace to go to, when the page asks for one.
@@ -775,7 +824,7 @@ pub fn draw(state: *State, ctx: context.Context) ?context.Workspace {
     defer c.ImGui_PopStyleVarEx(2);
 
     c.ImGui_SetCursorScreenPos(top);
-    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_ChildBg, theme.panel);
+    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_ChildBg, theme.colors.panel);
     _ = c.ImGui_BeginChild("scanner", gui.vec2(left, available.y), c.ImGuiChildFlags_None, c.ImGuiWindowFlags_NoScrollbar | c.ImGuiWindowFlags_NoScrollWithMouse);
     drawScanner(state, ctx, roll_index);
     gui.edge(.right);
@@ -783,23 +832,24 @@ pub fn draw(state: *State, ctx: context.Context) ?context.Workspace {
     c.ImGui_PopStyleColor();
 
     c.ImGui_SetCursorScreenPos(gui.vec2(top.x + left, top.y));
-    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_ChildBg, theme.viewer);
+    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_ChildBg, theme.colors.viewer);
     _ = c.ImGui_BeginChild("strip", gui.vec2(available.x - left - right, available.y), c.ImGuiChildFlags_None, c.ImGuiWindowFlags_NoScrollbar | c.ImGuiWindowFlags_NoScrollWithMouse);
+    const on_viewer = theme.beginViewer();
     if (roll_index == null) {
         if (drawNoRoll()) next = .rolls;
     } else drawMain(state, ctx, roll_index.?);
+    theme.endViewer(on_viewer);
     c.ImGui_EndChild();
     c.ImGui_PopStyleColor();
 
     c.ImGui_SetCursorScreenPos(gui.vec2(top.x + available.x - right, top.y));
-    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_ChildBg, theme.panel);
+    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_ChildBg, theme.colors.panel);
     _ = c.ImGui_BeginChild("queue", gui.vec2(right, available.y), c.ImGuiChildFlags_None, c.ImGuiWindowFlags_NoScrollbar | c.ImGuiWindowFlags_NoScrollWithMouse);
     if (drawQueue(state, ctx)) |w| next = w;
     gui.edge(.left);
     c.ImGui_EndChild();
     c.ImGui_PopStyleColor();
 
-    drawScannerSettings(state, ctx);
     if (state.boxes_dirty and !c.ImGui_IsAnyItemActive()) savePreviewSettings(state, ctx);
     return next;
 }
@@ -865,7 +915,7 @@ fn drawScanner(state: *State, ctx: context.Context, roll_index: ?usize) void {
         },
     };
     var y = origin.y + gui.px(panel_padding);
-    y += gui.headingAt(panel.list, panel.x, y, "SCANNER") + gui.px(scanner_gap);
+    y += gui.headingAt(panel.list, panel.x, y, i18n.t.scan.scanner_heading) + gui.px(scanner_gap);
     y = drawDevice(state, panel, y);
     y = drawSetup(state, panel, y);
     y = drawFilmChoice(state, panel, y);
@@ -891,28 +941,45 @@ const ScannerPanel = struct {
 /// The most scanners the device menu lists.
 const max_devices = 8;
 
-/// Draws the scanner menu at `y`. Returns the y below it.
+/// Draws the scanner's name at `y`, with a button that opens its settings, where it's picked.
+/// Returns the y below them.
 fn drawDevice(state: *State, panel: ScannerPanel, y: f32) f32 {
-    c.ImGui_BeginDisabled(panel.busy or state.devices.len == 0);
-    defer c.ImGui_EndDisabled();
-    var names: [max_devices][]const u8 = undefined;
-    const shown = @min(state.devices.len, names.len);
-    for (state.devices[0..shown], 0..) |d, i| names[i] = gui.print("{s} {s} ({s}, {s})", .{ d.vendor, d.model, d.kind.label(), d.driver });
-    const placeholder: []const []const u8 = &.{switch (panel.phase) {
-        .loading, .listing => "Looking for scanners…",
-        .unavailable => "No scanner drivers",
-        else => "No scanner found",
-    }};
-    const items = if (shown > 0) names[0..shown] else placeholder;
-    if (menu(panel, y, "device", items, state.device orelse 0)) |picked| {
-        if (shown > 0 and picked != state.device) {
-            state.device = picked;
-            if (state.capabilities) |*caps| caps.deinit(panel.ctx.gpa);
-            state.capabilities = null;
-            if (panel.worker) |w| w.submit(.{ .open = picked }) catch {};
-        }
+    const row = gui.px(device_height);
+    const side = c.ImGui_GetFrameHeight();
+    const name = if (state.openDevice()) |device| scannerName(device) else devicePlaceholder(panel.phase);
+    gui.textIn(panel.list, panel.x, y, row, theme.colors.text, gui.elideEnd(name, panel.width - side - gui.px(group_gap)));
+    c.ImGui_SetCursorScreenPos(gui.vec2(panel.x + panel.width - side, @round(y + (row - side) / 2)));
+    if (gui.iconButton("scanner settings", .quiet, .settings)) state.open_settings = true;
+    gui.tooltip(i18n.t.scan.scanner_settings);
+    return y + row + gui.px(scanner_gap);
+}
+
+/// What the scanner menu says while there's no scanner to list.
+fn devicePlaceholder(phase: scan_worker.Phase) [:0]const u8 {
+    return switch (phase) {
+        .loading, .listing => i18n.t.scan.looking_for_scanners_menu,
+        .unavailable => i18n.t.scan.no_scanner_drivers,
+        else => i18n.t.scan.no_scanner_found,
+    };
+}
+
+/// The device in `list` that's the scanner picked last, if it's connected.
+fn remembered(list: []const scan.Device, scanner: ?Preferences.Scanner) ?usize {
+    const wanted = scanner orelse return null;
+    for (list, 0..) |device, i| {
+        const name = scannerName(device);
+        if (wanted.eql(.{ .name = name, .driver = device.driver })) return i;
     }
-    return y + gui.px(device_height + scanner_gap);
+    return null;
+}
+
+/// Opens device `index` in place of the one that's open.
+fn openDeviceAt(state: *State, gpa: std.mem.Allocator, index: usize) void {
+    if (index == state.device) return;
+    state.device = index;
+    if (state.capabilities) |*caps| caps.deinit(gpa);
+    state.capabilities = null;
+    if (state.worker) |w| w.submit(.{ .open = index }) catch {};
 }
 
 /// Draws a drop-down of `items` across the panel at `y`, as tall as the scanner menu. Returns the
@@ -928,29 +995,20 @@ fn menu(panel: ScannerPanel, y: f32, id: [:0]const u8, items: []const []const u8
 fn drawSetup(state: *State, panel: ScannerPanel, top: f32) f32 {
     const ctx = panel.ctx;
     var y = top;
+    if (state.infrared) return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.colors.text_secondary, "Raw RGB + infrared; SDK linear capture") + gui.px(scanner_gap);
     if (state.capabilities) |caps| {
-        y += if (state.infrared)
-            gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.text_secondary, "Raw RGB + infrared") + gui.px(scanner_gap)
-        else
-            drawProfile(panel.list, panel.x, y, panel.width, caps, rawReport(state, ctx)) + gui.px(scanner_gap);
-        if (caps.options != null) {
-            c.ImGui_SetCursorScreenPos(gui.vec2(panel.x, y));
-            c.ImGui_BeginDisabled(state.infrared);
-            if (gui.buttonOf(.normal, "Scanner settings", gui.vec2(0, pill_height))) state.settings_open = true;
-            c.ImGui_EndDisabled();
-            y += gui.px(pill_height + scanner_gap);
-        }
-        return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.text_tertiary, filmAreaNote(caps, ctx, panel.roll_index)) + gui.px(scanner_gap);
+        y += drawProfile(panel.list, panel.x, y, panel.width, caps, rawReport(state, ctx)) + gui.px(scanner_gap);
+        return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.colors.text_tertiary, filmAreaNote(caps, ctx, panel.roll_index)) + gui.px(scanner_gap);
     }
     if (panel.busy) return y;
     if (panel.phase == .unavailable) {
         y = drawDriverSetup(ctx, panel.list, panel.x, y, panel.width);
     } else if (state.problem) |problem| {
-        y += gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.text_tertiary, problem) + gui.px(scanner_gap);
+        y += gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.colors.text_tertiary, problem.text()) + gui.px(scanner_gap);
     }
     // Looking again also loads the drivers again, once they're installed.
     c.ImGui_SetCursorScreenPos(gui.vec2(panel.x, y));
-    if (gui.buttonOf(.normal, "Refresh", gui.vec2(0, pill_height))) {
+    if (gui.buttonOf(.normal, i18n.t.common.refresh, gui.vec2(0, pill_height))) {
         state.problem = null;
         if (panel.worker) |w| w.submit(.list) catch {};
     }
@@ -960,15 +1018,15 @@ fn drawSetup(state: *State, panel: ScannerPanel, top: f32) f32 {
 /// Draws the film type, and for slides the holder, at `y`. Returns the y below them.
 fn drawFilmChoice(state: *State, panel: ScannerPanel, top: f32) f32 {
     var y = top;
-    y += gui.lineAt(panel.list, panel.x, y, theme.text_secondary, "Film type") + gui.px(group_gap);
+    y += gui.lineAt(panel.list, panel.x, y, theme.colors.text_secondary, i18n.t.scan.film_type) + gui.px(group_gap);
     c.ImGui_PushID("film");
-    if (pillsOf(FilmType, state.film, &labelsOf(FilmType), panel.x, &y, panel.width)) |picked| state.film = picked;
+    if (pillsOf(FilmType, state.film, &labelsOf(FilmType, FilmType.label), panel.x, &y, panel.width)) |picked| state.film = picked;
     c.ImGui_PopID();
     y += gui.px(group_gap);
     // Slides can come as a strip or in mounts, which detection finds differently.
     if (state.film == .positive) {
         c.ImGui_PushID("holder");
-        if (pillsOf(frames.Holder, state.holder_choice, &labelsOf(frames.Holder), panel.x, &y, panel.width)) |picked| {
+        if (pillsOf(frames.Holder, state.holder_choice, &labelsOf(frames.Holder, labels.holder), panel.x, &y, panel.width)) |picked| {
             state.holder_choice = picked;
             state.boxes_dirty = true;
         }
@@ -976,10 +1034,10 @@ fn drawFilmChoice(state: *State, panel: ScannerPanel, top: f32) f32 {
         y += gui.px(group_gap);
     }
     const film_note = if (state.capabilities) |caps| blk: {
-        if (!caps.film_setting) break :blk gui.print("No film mode", .{});
-        break :blk gui.print("Scanner mode: {s} · {s}", .{ filmMode(state, panel.ctx, caps), state.film.why() });
-    } else gui.print("Scanner mode: Positive Film · {s}", .{state.film.why()});
-    return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.text_tertiary, film_note) + gui.px(scanner_gap);
+        if (!caps.film_setting) break :blk i18n.t.scan.no_film_mode;
+        break :blk gui.say(i18n.t.scan.scanner_mode, .{ filmMode(state, panel.ctx, caps), state.film.why() });
+    } else gui.say(i18n.t.scan.scanner_mode, .{ i18n.t.scan.positive_film, state.film.why() });
+    return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.colors.text_tertiary, film_note) + gui.px(scanner_gap);
 }
 
 fn drawInfrared(state: *State, panel: ScannerPanel, top: f32) f32 {
@@ -988,13 +1046,13 @@ fn drawInfrared(state: *State, panel: ScannerPanel, top: f32) f32 {
         state.infrared = false;
         return top;
     }
+    if (state.infrared and std.mem.indexOfScalar(u32, &minilab.scan.sane_ir.resolutions, state.dpi) == null) state.dpi = 3200;
     const colour = state.film != .bw_negative and if (panel.roll_index) |r| panel.ctx.library.rolls.items[r].info.kind != .bw_negative else false;
     if (!colour) state.infrared = false;
     c.ImGui_SetCursorScreenPos(gui.vec2(panel.x, top));
     c.ImGui_BeginDisabled(state.scanning or !colour);
     if (gui.checkbox("Infrared dust removal", &state.infrared)) {
         if (state.infrared) {
-            state.settings_open = false;
             state.dpi_y = null;
             if (std.mem.indexOfScalar(u32, &minilab.scan.sane_ir.resolutions, state.dpi) == null) state.dpi = 3200;
         }
@@ -1002,13 +1060,13 @@ fn drawInfrared(state: *State, panel: ScannerPanel, top: f32) f32 {
     c.ImGui_EndDisabled();
     gui.tooltip("Separate infrared scan. Color film only; unsuitable for silver B&W and Kodachrome.");
     const note = if (!colour) "Color film only" else if (state.infrared) "Original and IR saved; correction can be turned off in Develop" else "800, 1600 or 3200 dpi";
-    return top + gui.px(pill_height + group_gap) + gui.paragraphAt(panel.list, panel.x, top + gui.px(pill_height + group_gap), panel.width, theme.text_tertiary, note) + gui.px(scanner_gap);
+    return top + gui.px(pill_height + group_gap) + gui.paragraphAt(panel.list, panel.x, top + gui.px(pill_height + group_gap), panel.width, theme.colors.text_tertiary, note) + gui.px(scanner_gap);
 }
 
 /// Draws the resolution menu at `y`, with the size of the scans. Returns the y below.
 fn drawResolution(state: *State, panel: ScannerPanel, top: f32) f32 {
     var y = top;
-    y += gui.lineAt(panel.list, panel.x, y, theme.text_secondary, "Resolution") + gui.px(group_gap);
+    y += gui.lineAt(panel.list, panel.x, y, theme.colors.text_secondary, i18n.t.scan.resolution) + gui.px(group_gap);
     const resolutions = if (state.infrared) &minilab.scan.sane_ir.resolutions else listedResolutions(state);
     if (resolutions.len > 0) {
         var labels_: [max_resolutions][]const u8 = undefined;
@@ -1023,7 +1081,7 @@ fn drawResolution(state: *State, panel: ScannerPanel, top: f32) f32 {
         y += gui.px(device_height + group_gap);
     }
     if (state.capabilities) |caps| if (!state.infrared) if (caps.axis_resolutions) |axes| {
-        y += gui.lineAt(panel.list, panel.x, y, theme.text_secondary, "Native X / Y resolution") + gui.px(group_gap);
+        y += gui.lineAt(panel.list, panel.x, y, theme.colors.text_secondary, i18n.t.scan.native_resolution) + gui.px(group_gap);
         for (axes, 0..) |values, axis| {
             const listed = values[values.len -| max_resolutions..];
             if (listed.len == 0) continue;
@@ -1041,17 +1099,17 @@ fn drawResolution(state: *State, panel: ScannerPanel, top: f32) f32 {
         }
     };
     if (state.dpi_y) |vertical| if (vertical != state.dpi) {
-        const note = gui.print("Native TIFF kept; square-pixel working copy at {d} dpi", .{@max(state.dpi, vertical)});
-        y += gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.text_tertiary, note) + gui.px(group_gap);
+        const note = gui.say(i18n.t.scan.native_archive_note, .{@max(state.dpi, vertical)});
+        y += gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.colors.text_tertiary, note) + gui.px(group_gap);
     };
-    return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.text_tertiary, sizeNote(state, panel.ctx, panel.roll_index)) + gui.px(scanner_gap);
+    return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.colors.text_tertiary, sizeNote(state, panel.ctx, panel.roll_index)) + gui.px(scanner_gap);
 }
 
 /// Draws the margin around the frames at `y`. Returns the y below it.
 fn drawMargin(state: *State, panel: ScannerPanel, y: f32) f32 {
     const field_height = gui.px(pill_height);
     const label_y = y + (field_height - gui.lineHeight()) / 2;
-    _ = gui.lineAt(panel.list, panel.x, label_y, theme.text_secondary, "Margin around frames");
+    _ = gui.lineAt(panel.list, panel.x, label_y, theme.colors.text_secondary, i18n.t.scan.margin);
     drawMarginField(state, gui.vec2(panel.x + panel.width - gui.px(margin_field_width), y));
     return y + field_height + gui.px(scanner_gap);
 }
@@ -1060,12 +1118,12 @@ fn drawMargin(state: *State, panel: ScannerPanel, y: f32) f32 {
 /// again. Returns the y below it.
 fn drawFit(state: *State, panel: ScannerPanel, top: f32) f32 {
     var y = top;
-    y += gui.lineAt(panel.list, panel.x, y, theme.text_secondary, "Frame detection") + gui.px(group_gap);
+    y += gui.lineAt(panel.list, panel.x, y, theme.colors.text_secondary, i18n.t.scan.frame_detection) + gui.px(group_gap);
     const ratio = if (panel.roll_index) |r| labels.ratio(panel.ctx.library.rolls.items[r].info.format.format().ratio()) else null;
     var items: [std.enums.values(frames.Fit).len][]const u8 = undefined;
     for (&items, std.enums.values(frames.Fit)) |*item, fit| item.* = switch (fit) {
-        .format => if (ratio) |text| gui.print("Preserve aspect ratio ({s})", .{text}) else "Preserve aspect ratio",
-        .whole => "Detect full frame",
+        .format => if (ratio) |text| gui.say(i18n.t.scan.fit_format_ratio, .{text}) else i18n.t.scan.fit_format,
+        .whole => i18n.t.scan.fit_whole,
     };
     c.ImGui_BeginDisabled(state.scanning);
     if (menu(panel, y, "fit", &items, @backingInt(state.fit))) |picked| {
@@ -1087,24 +1145,30 @@ fn drawActions(state: *State, panel: ScannerPanel, y: f32, bottom: f32) void {
     const ready = state.capabilities != null and !panel.busy and panel.roll_index != null;
     c.ImGui_SetCursorScreenPos(gui.vec2(panel.x, actions_y));
     c.ImGui_BeginDisabled(!ready);
-    const preview_label: [:0]const u8 = if (panel.phase == .previewing) gui.print("Previewing {d}%##preview", .{percent(panel.worker)}) else "Preview";
-    if (gui.buttonOf(.normal, preview_label, gui.vec2(half / gui.scale, action_height))) startPreview(state, ctx.gpa);
+    const preview_text = if (panel.phase == .previewing) gui.say(i18n.t.scan.previewing, .{percent(panel.worker)}) else i18n.t.scan.preview;
+    const preview_label = gui.print("{s}##preview", .{preview_text});
+    if (gui.buttonOf(.normal, preview_label, gui.vec2(half / gui.scale, action_height))) startPreview(state, ctx);
     c.ImGui_EndDisabled();
     c.ImGui_SetCursorScreenPos(gui.vec2(panel.x + half + gui.px(action_gap), actions_y));
     c.ImGui_BeginDisabled(state.preview == null or state.scanning);
-    if (gui.buttonOf(.normal, "Detect frames", gui.vec2(half / gui.scale, action_height))) detect(state, ctx, panel.roll_index);
+    if (gui.buttonOf(.normal, i18n.t.scan.detect_frames, gui.vec2(half / gui.scale, action_height))) detect(state, ctx, panel.roll_index);
     c.ImGui_EndDisabled();
     c.ImGui_SetCursorScreenPos(gui.vec2(panel.x, scan_y));
     const count = framesToScan(state);
     c.ImGui_BeginDisabled(!ready or count == 0 or state.preview == null);
-    const scan_label: [:0]const u8 = if (state.scanning) "Scanning…" else if (count == 0) "Scan" else if (count == 1) "Scan 1 frame" else gui.print("Scan {d} frames", .{count});
+    const scan_label = if (state.scanning) i18n.t.scan.scanning else switch (count) {
+        0 => i18n.t.scan.scan,
+        1 => i18n.t.scan.scan_one_frame,
+        else => gui.say(i18n.t.scan.scan_frames, .{count}),
+    };
     if (gui.buttonOf(.primary, scan_label, gui.vec2(panel.width / gui.scale, scan_button_height))) startScan(state, ctx, panel.roll_index);
     c.ImGui_EndDisabled();
 }
 
 /// What a Mac needs for scanning: Homebrew, then SANE from it.
 const homebrew_url = "https://brew.sh";
-const sane_install = "brew install sane-backends";
+const sane_package = "sane-backends";
+const sane_install = "brew install " ++ sane_package;
 /// Where Homebrew puts itself: on Apple silicon, and on Intel Macs.
 const homebrew_paths = [_][]const u8{ "/opt/homebrew/bin/brew", "/usr/local/bin/brew" };
 
@@ -1116,31 +1180,31 @@ fn drawDriverSetup(ctx: context.Context, list: *c.ImDrawList, x: f32, top: f32, 
     var y = top;
     switch (builtin.os.tag) {
         .windows => {
-            y += gui.lineAt(list, x, y, theme.text, "Scanner driver needed") + gui.px(group_gap);
-            y += gui.paragraphAt(list, x, y, width, theme.text_tertiary, "Scanner's TWAIN driver") + gui.px(scanner_gap);
+            y += gui.lineAt(list, x, y, theme.colors.text, i18n.t.scan.driver_needed) + gui.px(group_gap);
+            y += gui.paragraphAt(list, x, y, width, theme.colors.text_tertiary, i18n.t.scan.twain_driver) + gui.px(scanner_gap);
         },
         .macos => {
-            y += gui.lineAt(list, x, y, theme.text, "Scanner drivers needed: SANE") + gui.px(scanner_gap);
+            y += gui.lineAt(list, x, y, theme.colors.text, i18n.t.scan.drivers_needed_sane) + gui.px(scanner_gap);
             var has_homebrew = false;
             for (homebrew_paths) |path| {
                 if (std.Io.Dir.cwd().access(ctx.io, path, .{})) |_| has_homebrew = true else |_| {}
             }
-            y = setupStep(list, x, y, width, "1", "Homebrew", if (has_homebrew) "Installed" else null);
+            y = setupStep(list, x, y, width, "1", "Homebrew", if (has_homebrew) i18n.t.scan.installed else null);
             if (!has_homebrew) {
                 c.ImGui_SetCursorScreenPos(gui.vec2(x + gui.px(step_indent), y));
-                if (gui.buttonOf(.normal, "Get Homebrew", gui.vec2(0, pill_height))) gui.openUrl(homebrew_url);
+                if (gui.buttonOf(.normal, i18n.t.scan.get_homebrew, gui.vec2(0, pill_height))) gui.openUrl(homebrew_url);
                 gui.tooltip("brew.sh");
                 y += gui.px(pill_height) + gui.px(scanner_gap);
             }
             y = setupStep(list, x, y, width, "2", "SANE", sane_install);
             c.ImGui_SetCursorScreenPos(gui.vec2(x + gui.px(step_indent), y));
-            context.copyButton(ctx.notice, sane_install, gui.vec2(0, pill_height));
+            context.copyButton(ctx.notice, sane_install);
             y += gui.px(pill_height) + gui.px(scanner_gap);
-            y = setupStep(list, x, y, width, "3", "Refresh", null);
+            y = setupStep(list, x, y, width, "3", i18n.t.common.refresh, null);
         },
         else => {
-            y += gui.lineAt(list, x, y, theme.text, "Scanner drivers needed: SANE") + gui.px(group_gap);
-            y += gui.paragraphAt(list, x, y, width, theme.text_tertiary, "sane-backends package") + gui.px(scanner_gap);
+            y += gui.lineAt(list, x, y, theme.colors.text, i18n.t.scan.drivers_needed_sane) + gui.px(group_gap);
+            y += gui.paragraphAt(list, x, y, width, theme.colors.text_tertiary, gui.say(i18n.t.scan.sane_package, .{sane_package})) + gui.px(scanner_gap);
         },
     }
     return y;
@@ -1154,16 +1218,16 @@ const step_indent = 22;
 fn setupStep(list: *c.ImDrawList, x: f32, top: f32, width: f32, number: [:0]const u8, name: []const u8, detail: ?[]const u8) f32 {
     const radius = gui.px(step_radius);
     const middle = top + gui.lineHeight() / 2;
-    c.ImDrawList_AddCircleFilled(list, gui.vec2(x + radius, middle), radius, theme.imU32(theme.control), step_segments);
+    c.ImDrawList_AddCircleFilled(list, gui.vec2(x + radius, middle), radius, theme.imU32(theme.colors.control), step_segments);
     fonts.pushSized(.mono, fonts.caption_size);
     const size = c.ImGui_CalcTextSize(number);
-    c.ImDrawList_AddText(list, gui.vec2(x + radius - size.x / 2, middle - size.y / 2), theme.imU32(theme.text), number);
+    c.ImDrawList_AddText(list, gui.vec2(x + radius - size.x / 2, middle - size.y / 2), theme.imU32(theme.colors.text), number);
     fonts.pop();
     var y = top;
-    y += gui.lineAt(list, x + gui.px(step_indent), y, theme.text_secondary, name);
+    y += gui.lineAt(list, x + gui.px(step_indent), y, theme.colors.text_secondary, name);
     if (detail) |text| {
         fonts.pushSized(.mono, fonts.small_size);
-        y += gui.paragraphAt(list, x + gui.px(step_indent), y, width - gui.px(step_indent), theme.text_tertiary, text);
+        y += gui.paragraphAt(list, x + gui.px(step_indent), y, width - gui.px(step_indent), theme.colors.text_tertiary, text);
         fonts.pop();
     }
     return y + gui.px(group_gap);
@@ -1177,14 +1241,13 @@ fn drawProfile(list: *c.ImDrawList, x: f32, y: f32, width: f32, caps: scan.Capab
     const icon = gui.px(setup_note.icon);
     const text_x = x + pad_x + icon + gui.px(setup_note.icon_gap);
     const text_width = width - (text_x - x) - pad_x;
-    var raw_buffer: [96]u8 = undefined;
-    const message = if (caps.profile) |p| gui.print("Profile: {s}", .{p.summary}) else gui.print("{s}", .{raw.label(&raw_buffer)});
+    const message = if (caps.profile) |p| gui.say(i18n.t.scan.profile, .{p.summary}) else rawText(raw);
     const text_height = gui.paragraphHeight(message, text_width);
     const height = text_height + 2 * pad_y;
-    c.ImDrawList_AddRectFilledEx(list, gui.vec2(x, y), gui.vec2(x + width, y + height), theme.imU32(theme.raised), gui.px(gui.control_rounding), 0);
+    c.ImDrawList_AddRectFilledEx(list, gui.vec2(x, y), gui.vec2(x + width, y + height), theme.imU32(theme.colors.raised), gui.px(gui.control_rounding), 0);
     const icon_at = gui.vec2(x + pad_x, y + (height - icon) / 2);
-    if (caps.profile != null or raw.linear) drawTick(list, icon_at, theme.ready) else drawInfo(list, icon_at, icon, theme.text_secondary);
-    _ = gui.paragraphAt(list, text_x, y + pad_y, text_width, theme.text_secondary, message);
+    if (caps.profile != null or raw.linear) drawTick(list, icon_at, theme.colors.ready) else drawInfo(list, icon_at, icon, theme.colors.text_secondary);
+    _ = gui.paragraphAt(list, text_x, y + pad_y, text_width, theme.colors.text_secondary, message);
     return height;
 }
 
@@ -1215,53 +1278,73 @@ fn sendRaw(state: *const State, ctx: context.Context) void {
     worker.submit(.{ .raw = owned }) catch owned.deinit();
 }
 
-/// The scanner settings window: each option raw setup sets, at Auto (what raw setup picks) or at
-/// another value. The changes are kept in the library, per scanner and driver.
-fn drawScannerSettings(state: *State, ctx: context.Context) void {
-    if (!state.settings_open) return;
-    const device = state.openDevice();
-    const options = if (state.capabilities) |caps| caps.options else null;
-    if (device == null or options == null) {
-        state.settings_open = false;
-        return;
-    }
-    const name = scannerName(device.?);
-    const driver = device.?.driver;
-    const settings = &ctx.library.scanner_settings;
+/// The width of the Scanner page's labels, in the design's pixels. Wider than other pages
+/// since the options go by their drivers' names, like "gamma-correction".
+const page_label_width = 140;
 
-    if (!gui.beginDialog("scanner settings")) {
-        state.settings_open = false;
-        return;
+/// The Scanner page of Settings: which scanner to use, and each option raw setup sets on it, at
+/// Auto (what raw setup picks) or another value. The scanner picked goes in the preferences, so
+/// it opens again next time. The options are kept in the library, per scanner and driver.
+pub fn drawSettingsPage(state: *State, ctx: context.Context, values: *Preferences) void {
+    const phase: scan_worker.Phase = if (state.worker) |w| w.phase.load(.acquire) else .unavailable;
+    const busy = switch (phase) {
+        .idle, .unavailable => false,
+        else => true,
+    };
+    const value_width = (c.ImGui_GetContentRegionAvail().x - gui.px(page_label_width + gui.label_gap)) / gui.scale;
+
+    pageLabel(i18n.t.settings.scanner);
+    var names: [max_devices][]const u8 = undefined;
+    const shown = @min(state.devices.len, names.len);
+    for (state.devices[0..shown], 0..) |d, i| names[i] = gui.print("{s} ({s}, {s})", .{ scannerName(d), d.kind.label(), d.driver });
+    const placeholder: []const []const u8 = &.{devicePlaceholder(phase)};
+    c.ImGui_BeginDisabled(busy or shown == 0);
+    if (gui.combo("scanner", if (shown > 0) names[0..shown] else placeholder, state.device orelse 0, value_width)) |picked| {
+        if (picked < shown) {
+            openDeviceAt(state, ctx.gpa, picked);
+            const device = state.devices[picked];
+            values.scanner = .{ .name = scannerName(device), .driver = device.driver };
+        }
     }
-    defer c.ImGui_EndPopup();
-    gui.title("Scanner settings", fonts.title_size);
-    gui.textColored(theme.text_tertiary, gui.print("{s} · {s}", .{ name, driver }));
-    const changes = settings.raw(name, driver);
-    var report_buffer: [96]u8 = undefined;
-    gui.textColored(theme.text_secondary, scan.rawSetup(options.?.items, changes).report.label(&report_buffer));
+    c.ImGui_EndDisabled();
+
+    const resolutions: []const u32 = if (state.capabilities) |caps| caps.resolutions else &.{};
+    pageLabel(i18n.t.scan.preview);
+    if (resolutionMenu("preview", resolutions, .lowest, values.preview_dpi, value_width)) |dpi| values.preview_dpi = dpi;
+    pageLabel(i18n.t.settings.scans);
+    if (resolutionMenu("scans", resolutions, .highest, values.scan_dpi, value_width)) |dpi| {
+        values.scan_dpi = dpi;
+        if (!state.scanning) state.dpi = dpi;
+    }
+
+    const device = state.openDevice() orelse return;
+    const options = (state.capabilities orelse return).options orelse return;
+    c.ImGui_Dummy(gui.vec2(0, gui.px(gui.dialog.gap)));
+    const name = scannerName(device);
+    const settings = &ctx.library.scanner_settings;
+    const changes = settings.raw(name, device.driver);
+    c.ImGui_SetCursorPosX(c.ImGui_GetCursorPosX() + gui.px(page_label_width + gui.label_gap));
+    gui.textColored(theme.colors.text_tertiary, rawText(scan.rawSetup(options.items, changes).report));
     c.ImGui_Dummy(gui.vec2(0, gui.px(gui.dialog.gap)));
 
     var changed = false;
-    const controls = scan.rawControls(options.?.items);
-    if (controls.len == 0) gui.textColored(theme.text_tertiary, "Nothing to set");
+    const controls = scan.rawControls(options.items);
+    if (controls.len == 0) gui.textColored(theme.colors.text_tertiary, i18n.t.scan.nothing_to_set);
     for (controls.all(), 0..) |control, i| {
         c.ImGui_PushIDInt(@intCast(i));
         defer c.ImGui_PopID();
-        const x = c.ImGui_GetCursorPosX();
-        c.ImGui_AlignTextToFramePadding();
-        gui.textColored(theme.text_secondary, settingLabel(control));
-        c.ImGui_SameLineEx(x + gui.px(setting_label_width), 0);
+        pageLabel(settingLabel(control));
 
         var values_buffer: [max_setting_values]scan.RawValue = undefined;
-        const values = settingValues(control, &values_buffer);
+        const choices = settingValues(control, &values_buffer);
         // Auto first, then the values, then a change whose value the scanner doesn't offer now.
         var items: [max_setting_values + 2][]const u8 = undefined;
-        items[0] = gui.print("Auto · {s}", .{valueLabel(control, control.auto)});
-        for (values, 1..) |value, k| items[k] = valueLabel(control, value);
-        var count = values.len + 1;
+        items[0] = gui.say(i18n.t.scan.auto_value, .{valueLabel(control, control.auto)});
+        for (choices, 1..) |value, k| items[k] = valueLabel(control, value);
+        var count = choices.len + 1;
         var chosen: usize = 0;
         if (scan.valueOf(changes, control.option.name)) |current| {
-            chosen = for (values, 1..) |value, k| {
+            chosen = for (choices, 1..) |value, k| {
                 if (value.eql(current)) break k;
             } else extra: {
                 items[count] = valueLabel(control, current);
@@ -1269,50 +1352,87 @@ fn drawScannerSettings(state: *State, ctx: context.Context) void {
                 break :extra count - 1;
             };
         }
-        const picked = gui.combo("value", items[0..count], chosen, setting_value_width) orelse continue;
-        if (picked == chosen or picked > values.len) continue;
-        const value: ?scan.RawValue = if (picked == 0) null else values[picked - 1];
-        settings.set(ctx.io, name, driver, control.option.name, value) catch |err| {
-            std.log.err("can't save the scanner settings: {t}", .{err});
-            ctx.notice.set("Scanner settings not saved", .{});
-        };
+        c.ImGui_BeginDisabled(state.scanning);
+        defer c.ImGui_EndDisabled();
+        const picked = gui.combo("value", items[0..count], chosen, value_width) orelse continue;
+        if (picked == chosen or picked > choices.len) continue;
+        const value: ?scan.RawValue = if (picked == 0) null else choices[picked - 1];
+        settings.set(ctx.io, name, device.driver, control.option.name, value) catch |err| notSaved(ctx, err);
         changed = true;
     }
 
     c.ImGui_Dummy(gui.vec2(0, gui.px(gui.dialog.gap)));
-    c.ImGui_BeginDisabled(changes.len == 0);
-    if (gui.buttonOf(.normal, "Reset", gui.vec2(0, gui.button_height))) {
-        settings.reset(ctx.io, name, driver) catch |err| {
-            std.log.err("can't save the scanner settings: {t}", .{err});
-            ctx.notice.set("Scanner settings not saved", .{});
-        };
+    c.ImGui_SetCursorPosX(c.ImGui_GetCursorPosX() + gui.px(page_label_width + gui.label_gap));
+    c.ImGui_BeginDisabled(changes.len == 0 or state.scanning);
+    if (gui.buttonOf(.normal, i18n.t.common.reset, gui.vec2(0, gui.button_height))) {
+        settings.reset(ctx.io, name, device.driver) catch |err| notSaved(ctx, err);
         changed = true;
     }
     c.ImGui_EndDisabled();
-    c.ImGui_SameLineEx(0, gui.px(gui.dialog.gap));
-    if (gui.buttonOf(.primary, "Done", gui.vec2(0, gui.button_height)) or c.ImGui_IsKeyPressed(c.ImGuiKey_Escape)) {
-        state.settings_open = false;
-        c.ImGui_CloseCurrentPopup();
-    }
     if (changed) sendRaw(state, ctx);
+}
+
+/// Which end of a long list of resolutions a menu keeps: the lowest for previews, the highest for
+/// scans.
+const End = enum { lowest, highest };
+
+/// A drop-down of the scanner's `resolutions`, `width` design pixels wide, with `dpi` picked. It
+/// shows `dpi` alone, and can't be opened, while no scanner is open. Returns the one picked.
+fn resolutionMenu(id: [:0]const u8, resolutions: []const u32, end: End, dpi: u32, width: f32) ?u32 {
+    const listed = switch (end) {
+        .lowest => resolutions[0..@min(resolutions.len, max_resolutions)],
+        .highest => resolutions[resolutions.len -| max_resolutions..],
+    };
+    var items: [max_resolutions + 1][]const u8 = undefined;
+    for (items[0..listed.len], listed) |*item, r| item.* = gui.print("{d} dpi", .{r});
+    // A resolution this scanner doesn't have is shown after its own, as it was picked.
+    const chosen = std.mem.indexOfScalar(u32, listed, dpi) orelse extra: {
+        items[listed.len] = gui.print("{d} dpi", .{dpi});
+        break :extra listed.len;
+    };
+    const count = @max(listed.len, chosen + 1);
+    c.ImGui_BeginDisabled(listed.len == 0);
+    defer c.ImGui_EndDisabled();
+    const picked = gui.combo(id, items[0..count], chosen, width) orelse return null;
+    return if (picked < listed.len) listed[picked] else null;
+}
+
+/// A row's label on the Scanner page, with the control going after it.
+fn pageLabel(label: []const u8) void {
+    const x = c.ImGui_GetCursorPosX();
+    c.ImGui_AlignTextToFramePadding();
+    gui.textColored(theme.colors.text_secondary, label);
+    c.ImGui_SameLineEx(x + gui.px(page_label_width + gui.label_gap), 0);
+}
+
+fn notSaved(ctx: context.Context, err: anyerror) void {
+    std.log.err("can't save the scanner settings: {t}", .{err});
+    ctx.notice.set("{s}", .{i18n.t.scan.settings_not_saved});
+}
+
+/// What raw setup leaves the scanner at (`report`), such as "Raw · gamma 1.0 · color correction
+/// off".
+fn rawText(report: scan.RawReport) [:0]const u8 {
+    if (!report.linear) return i18n.t.scan.raw_not_linear;
+    return if (report.colour_off) i18n.t.scan.raw_linear_colour_off else i18n.t.scan.raw_linear;
 }
 
 /// The scanner's film mode as its driver names it, such as "Positive Film".
 fn filmMode(state: *const State, ctx: context.Context, caps: scan.Capabilities) []const u8 {
     if (caps.profile) |p| if (p.film) |film| return film.value(scanner_film);
-    const options = caps.options orelse return "Positive";
+    const options = caps.options orelse return i18n.t.scan.film_types.positive;
     const setup = scan.rawSetup(options.items, rawChanges(state, ctx));
     for (scan.rawControls(options.items).all()) |control| {
         if (control.role != .film) continue;
         return valueLabel(control, scan.valueOf(setup.settings(), control.option.name) orelse .leave);
     }
-    return "Positive";
+    return i18n.t.scan.film_types.positive;
 }
 
 /// A scanner setting's name: the driver's name for the option.
 fn settingLabel(control: scan.RawControl) []const u8 {
     return switch (control.role) {
-        .colour_matrix => "cct-1 to cct-9",
+        .colour_matrix => gui.say(i18n.t.scan.option_range, .{ scan.colour_matrix[0], scan.colour_matrix[scan.colour_matrix.len - 1] }),
         else => control.option.name,
     };
 }
@@ -1345,11 +1465,11 @@ fn settingValues(control: scan.RawControl, buffer: *[max_setting_values]scan.Raw
 /// A setting's value as its drop-down shows it.
 fn valueLabel(control: scan.RawControl, value: scan.RawValue) []const u8 {
     return switch (value) {
-        .leave => "Driver default",
-        .film => scan.filmChoice(control.option.choices, scanner_film) orelse "Positive",
+        .leave => i18n.t.scan.driver_default,
+        .film => scan.filmChoice(control.option.choices, scanner_film) orelse i18n.t.scan.film_types.positive,
         .choose => |choice| choice,
-        .number => |n| if (control.option.kind == .bool) (if (n != 0) "On" else "Off") else gui.print("{d}", .{n}),
-        .straight => if (control.option.kind == .matrix) "Identity" else "Straight",
+        .number => |n| if (control.option.kind == .bool) (if (n != 0) i18n.t.scan.on else i18n.t.scan.off) else gui.print("{d}", .{n}),
+        .straight => if (control.option.kind == .matrix) i18n.t.scan.identity else i18n.t.scan.straight,
     };
 }
 
@@ -1360,15 +1480,25 @@ fn filmAreaNote(caps: scan.Capabilities, ctx: context.Context, roll_index: ?usiz
     if (roll_index) |r| {
         const format = ctx.library.rolls.items[r].info.format.format();
         if (format.height_mm > width) {
-            return gui.print("Film area {d:.2} mm · too narrow for {s} ({d:.0} mm)", .{ width, format.size.label(), format.height_mm });
+            return gui.say(i18n.t.scan.film_area_too_narrow, .{ mm2(width), labels.filmSizeName(format.size), mm0(format.height_mm) });
         }
         if (format.size.filmWidthMm()) |film| if (film > width) {
-            return gui.print("Film area {d:.2} mm · {d:.0} mm frames fit, edges under the holder", .{ width, format.height_mm });
+            return gui.say(i18n.t.scan.film_area_edges_hidden, .{ mm2(width), mm0(format.height_mm) });
         };
     }
     const across_120 = formats.Standard.@"120_6x4.5".format().height_mm;
-    if (width < across_120) return gui.print("Film area {d:.2} mm · 135 and narrower", .{width});
-    return gui.print("Film area {d:.2} × {d:.2} mm", .{ width, caps.area.height });
+    if (width < across_120) return gui.say(i18n.t.scan.film_area_narrow, .{mm2(width)});
+    return gui.say(i18n.t.scan.film_area, .{ mm2(width), mm2(caps.area.height) });
+}
+
+/// A length in mm with two decimals, for a message. It lasts for this frame.
+fn mm2(value: f32) [:0]const u8 {
+    return gui.print("{d:.2}", .{value});
+}
+
+/// A length in whole mm, for a message. It lasts for this frame.
+fn mm0(value: f32) [:0]const u8 {
+    return gui.print("{d:.0}", .{value});
 }
 
 /// The resolutions the menu lists: the scanner's, or its highest ones when it has too many.
@@ -1398,11 +1528,21 @@ fn sizeNote(state: *const State, ctx: context.Context, roll_index: ?usize) []con
     along_mm += 2 * state.margin_mm;
     const width: u64 = @intFromFloat(@round(across_mm * dpi / mm_per_inch));
     const height: u64 = @intFromFloat(@round(along_mm * @as(f32, @floatFromInt(state.dpi_y orelse state.dpi)) / mm_per_inch));
-    const deep = if (state.capabilities) |caps| caps.deep else true;
-    const megabytes = labels.megabytes(width * height * @as(u64, if (deep) 6 else 3));
-    const about: []const u8 = if (estimate) "About " else "";
-    if (megabytes < 10) return gui.print("{s}{d} × {d} px per frame", .{ about, width, height });
-    return gui.print("{s}{d} × {d} px · {d} MB per frame", .{ about, width, height, megabytes });
+    const megabytes = labels.megabytes(captureBytes(width, height, .{ state.dpi, state.dpi_y orelse state.dpi }));
+    if (megabytes < 10) return gui.say(if (estimate) i18n.t.scan.size_about else i18n.t.scan.size, .{ width, height });
+    return gui.say(if (estimate) i18n.t.scan.size_about_mb else i18n.t.scan.size_mb, .{ width, height, megabytes });
+}
+
+/// Uncompressed TIFF bytes: every stored raw scan has three 16-bit channels.
+/// Rectangular captures also keep the working copy at the higher density.
+fn captureBytes(width: u64, height: u64, dpi: [2]u32) u64 {
+    const bytes_per_pixel = image.channel_count * @sizeOf(u16);
+    const native = width * height * bytes_per_pixel;
+    if (dpi[0] == dpi[1]) return native;
+    const target = @max(dpi[0], dpi[1]);
+    const working_width: u64 = @max(1, @as(u64, @intFromFloat(@round(@as(f64, @floatFromInt(width)) * target / dpi[0]))));
+    const working_height: u64 = @max(1, @as(u64, @intFromFloat(@round(@as(f64, @floatFromInt(height)) * target / dpi[1]))));
+    return native + working_width * working_height * bytes_per_pixel;
 }
 
 /// The margin field, in mm. It shows "1.0 mm" and edits as a plain number.
@@ -1432,11 +1572,11 @@ fn drawMarginField(state: *State, corner: gui.Vec2) void {
     }
     const hovered = c.ImGui_IsItemHovered(0);
     const far = gui.vec2(corner.x + width, corner.y + height);
-    c.ImDrawList_AddRectFilledEx(list, corner, far, theme.imU32(if (hovered) theme.control_hover else theme.control), gui.px(gui.control_rounding), 0);
-    c.ImDrawList_AddRectEx(list, corner, far, theme.imU32(theme.border), gui.px(gui.control_rounding), 1, 0);
+    c.ImDrawList_AddRectFilledEx(list, corner, far, theme.imU32(if (hovered) theme.colors.control_hover else theme.colors.control), gui.px(gui.control_rounding), 0);
+    c.ImDrawList_AddRectEx(list, corner, far, theme.imU32(theme.colors.border), gui.px(gui.control_rounding), 1, 0);
     const shown = gui.print("{d:.1} mm", .{state.margin_mm});
     const size = c.ImGui_CalcTextSize(shown);
-    c.ImDrawList_AddText(list, gui.vec2(far.x - gui.px(field_padding_x) - size.x, corner.y + (height - size.y) / 2), theme.imU32(theme.text), shown);
+    c.ImDrawList_AddText(list, gui.vec2(far.x - gui.px(field_padding_x) - size.x, corner.y + (height - size.y) / 2), theme.imU32(theme.colors.text), shown);
 }
 
 fn percent(worker: ?*Worker) u32 {
@@ -1444,10 +1584,11 @@ fn percent(worker: ?*Worker) u32 {
     return @intFromFloat(@round(w.progress.fraction() * 100));
 }
 
-fn startPreview(state: *State, gpa: std.mem.Allocator) void {
+fn startPreview(state: *State, ctx: context.Context) void {
+    const gpa = ctx.gpa;
     const worker = state.worker orelse return;
     const caps = state.capabilities orelse return;
-    const dpi = caps.resolutionFrom(preview_dpi) orelse return;
+    const dpi = caps.resolutionFrom(ctx.preferences.values.preview_dpi) orelse return;
     if (state.preview_for) |p| gpa.free(p);
     state.preview_for = if (state.roll_path) |p| gpa.dupe(u8, p) catch null else null;
     worker.submit(.{ .preview = .{
@@ -1463,7 +1604,7 @@ fn startPreview(state: *State, gpa: std.mem.Allocator) void {
 fn drawNoRoll() bool {
     const origin = c.ImGui_GetWindowPos();
     const go = gui.noRoll(gui.vec2(origin.x + gui.px(main_padding_x), origin.y + gui.px(main_padding_y)));
-    shortcuts.tooltip("Rolls", .rolls);
+    shortcuts.tooltip(i18n.t.labels.workspace.rolls, .rolls);
     return go;
 }
 
@@ -1474,20 +1615,20 @@ fn drawMain(state: *State, ctx: context.Context, roll_index: usize) void {
     const x = origin.x + gui.px(main_padding_x);
     const y = origin.y + gui.px(main_padding_y);
     const height = size.y - gui.px(2 * main_padding_y);
-    const strip_width = drawPreviewColumn(state, list, x, y, height, ctx.library.rolls.items[roll_index].info);
+    const strip_width = drawPreviewColumn(state, list, x, y, height, ctx.library.rolls.items[roll_index].info, ctx.preferences.values.preview_dpi);
     const section_x = x + strip_width + gui.px(main_gap);
     const section_width = origin.x + size.x - gui.px(main_padding_x) - section_x;
     drawFrameSection(state, ctx, roll_index, list, section_x, y, section_width);
 }
 
 /// Draws the preview with the frames on it. Returns the column's width.
-fn drawPreviewColumn(state: *State, list: *c.ImDrawList, x: f32, top: f32, height: f32, info: minilab.roll.Info) f32 {
+fn drawPreviewColumn(state: *State, list: *c.ImDrawList, x: f32, top: f32, height: f32, info: minilab.roll.Info, preview_dpi: u32) f32 {
     const format = info.format.format();
     const film = format.size;
     var y = top;
     const dpi_shown: u32 = if (state.preview) |p| @intFromFloat(@round(p.dpi[0])) else if (state.capabilities) |caps| caps.resolutionFrom(preview_dpi) orelse preview_dpi else preview_dpi;
-    const label = gui.print("Preview · {d} dpi", .{dpi_shown});
-    y += gui.lineAt(list, x, y, theme.text_secondary, label) + gui.px(preview_gap);
+    const label = gui.say(i18n.t.scan.preview_dpi, .{dpi_shown});
+    y += gui.lineAt(list, x, y, theme.colors.text_secondary, label) + gui.px(preview_gap);
 
     // The film area scaled to fill the column's height, with its width following.
     const area: scan.Area = if (state.preview) |p| p.area else if (state.capabilities) |caps| caps.area else default_film_area;
@@ -1512,14 +1653,14 @@ fn drawPreviewColumn(state: *State, list: *c.ImDrawList, x: f32, top: f32, heigh
             const map: StripMap = .film(p, corner, shown, across_mm, strips);
             if (mounted) drawMounts(state, p, map, list) else drawFilm(state, p, map, format, info.stock, list);
             drawBoxesOnStrip(state, p, map, list);
-        } else if (p.texture) |t| c.ImDrawList_AddImage(list, t.ref(), corner, far) else c.ImDrawList_AddRectFilled(list, corner, far, theme.imU32(theme.header));
+        } else if (p.texture) |t| c.ImDrawList_AddImage(list, t.ref(), corner, far) else c.ImDrawList_AddRectFilled(list, corner, far, theme.imU32(theme.colors.header));
     } else {
-        c.ImDrawList_AddRectFilled(list, corner, far, theme.imU32(theme.header));
-        gui.dashedRect(list, corner, far, theme.imU32(theme.border), 1, gui.px(dash), gui.px(dash_gap));
+        c.ImDrawList_AddRectFilled(list, corner, far, theme.imU32(theme.colors.header));
+        gui.dashedRect(list, corner, far, theme.imU32(theme.colors.border), 1, gui.px(dash), gui.px(dash_gap));
         const busy = if (state.worker) |w| w.phase.load(.acquire) == .previewing else false;
         if (busy) {
             const done = if (state.worker) |w| w.progress.fraction() else 0;
-            c.ImDrawList_AddRectFilled(list, corner, gui.vec2(far.x, corner.y + shown.y * done), theme.imU32(theme.control));
+            c.ImDrawList_AddRectFilled(list, corner, gui.vec2(far.x, corner.y + shown.y * done), theme.imU32(theme.colors.control));
         }
     }
     y += shown.y + gui.px(preview_gap);
@@ -1527,7 +1668,7 @@ fn drawPreviewColumn(state: *State, list: *c.ImDrawList, x: f32, top: f32, heigh
     fonts.pushSized(.mono, fonts.small_size);
     const mm = gui.print("{d:.2} × {d:.2} mm", .{ area.width, area.height });
     const mm_width = c.ImGui_CalcTextSize(mm).x;
-    c.ImDrawList_AddText(list, gui.vec2(x, y + (mono_line - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.text_tertiary), mm);
+    c.ImDrawList_AddText(list, gui.vec2(x, y + (mono_line - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.colors.text_tertiary), mm);
     fonts.pop();
     y += mono_line + gui.px(preview_gap);
     return @max(shown.x, mm_width);
@@ -1638,7 +1779,7 @@ fn drawMounts(state: *const State, preview: *const Preview, map: StripMap, list:
 fn drawFilm(state: *const State, preview: *const Preview, map: StripMap, format: formats.Format, stock: ?[]const u8, list: *c.ImDrawList) void {
     const film = format.size;
     const bottom = map.corner.y + map.shown.y;
-    const base = preview.base_colour orelse theme.rgba8(theme.raised);
+    const base = preview.base_colour orelse theme.rgba8(theme.colors.raised);
     const per_mm = map.along * preview.alongPerMm();
     const across_per_mm = map.strip_width / filmWidthMm(state, preview, film);
     // On the negative, the maker's edge print is exposed film, so it's denser than the base.
@@ -1654,11 +1795,11 @@ fn drawFilm(state: *const State, preview: *const Preview, map: StripMap, format:
             // In step with the strip's first frame.
             .rows => |p| for (state.boxes.items) |box| {
                 if (box.opening != opening) continue;
-                holes.rows(list, strip, p, map.corner.y + box.start() * map.along, theme.viewer);
+                holes.rows(list, strip, p, map.corner.y + box.start() * map.along, theme.colors.viewer);
                 break;
             },
             .per_frame => |count| for (state.boxes.items) |box| {
-                if (box.opening == opening) holes.atFrame(list, strip, count, map.corner.y + box.start() * map.along, theme.viewer);
+                if (box.opening == opening) holes.atFrame(list, strip, count, map.corner.y + box.start() * map.along, theme.colors.viewer);
             },
         }
         if (holes.edgeMm(film, format.height_mm)) |edge| for (state.boxes.items, 0..) |box, i| {
@@ -1711,13 +1852,13 @@ fn drawBoxesOnStrip(state: *State, preview: *Preview, map: StripMap, list: *c.Im
         c.ImGui_PopID();
 
         const weak = box.check != null;
-        const ink = theme.imU32(if (box.skip) theme.text_tertiary else if (weak) theme.text else theme.accent);
+        const ink = theme.imU32(if (box.skip) theme.colors.text_tertiary else if (weak) theme.colors.text else theme.colors.accent);
         const inset = gui.px(box_inset);
         const inner_min = gui.vec2(min.x + inset, min.y + inset);
         const inner_max = gui.vec2(max.x - inset, max.y - inset);
         if (weak) gui.dashedRect(list, inner_min, inner_max, ink, gui.px(box_line), gui.px(dash), gui.px(dash_gap)) else c.ImDrawList_AddRectEx(list, inner_min, inner_max, ink, 0, gui.px(box_line), 0);
         const ring = gui.px(ring_offset);
-        if (state.selected == i) c.ImDrawList_AddRectEx(list, gui.vec2(min.x - ring, min.y - ring), gui.vec2(max.x + ring, max.y + ring), theme.imU32(theme.text), 0, gui.px(ring_thickness), 0);
+        if (state.selected == i) c.ImDrawList_AddRectEx(list, gui.vec2(min.x - ring, min.y - ring), gui.vec2(max.x + ring, max.y + ring), theme.imU32(theme.colors.text), 0, gui.px(ring_thickness), 0);
 
         // The number chip.
         fonts.pushSized(.mono, fonts.tiny_size);
@@ -1726,7 +1867,7 @@ fn drawBoxesOnStrip(state: *State, preview: *Preview, map: StripMap, list: *c.Im
         const chip_min = gui.vec2(min.x + gui.px(chip_inset), min.y + gui.px(chip_inset));
         const chip_max = gui.vec2(chip_min.x + size.x + gui.px(2 * chip_padding), chip_min.y + gui.lineFor(fonts.tiny_size));
         c.ImDrawList_AddRectFilledEx(list, chip_min, chip_max, ink, gui.px(gui.track_rounding), 0);
-        c.ImDrawList_AddText(list, gui.vec2(chip_min.x + gui.px(chip_padding), chip_min.y + (chip_max.y - chip_min.y - size.y) / 2), theme.imU32(theme.on_accent), chip);
+        c.ImDrawList_AddText(list, gui.vec2(chip_min.x + gui.px(chip_padding), chip_min.y + (chip_max.y - chip_min.y - size.y) / 2), theme.imU32(theme.colors.on_accent), chip);
         fonts.pop();
     }
     if (state.drag != null and !c.ImGui_IsMouseDown(0)) state.drag = null;
@@ -1766,16 +1907,16 @@ fn drawFrameSection(state: *State, ctx: context.Context, roll_index: usize, list
     const info = ctx.library.rolls.items[roll_index].info;
     const format = info.format.format();
     const preview = if (state.preview) |*p| p else {
-        y += titleAt(list, x, y, "No preview yet", null) + gui.px(section_gap);
-        _ = gui.paragraphAt(list, x, y, @min(width, gui.px(note_max_width)), theme.text_secondary, "No preview");
+        y += titleAt(list, x, y, i18n.t.scan.no_preview_yet, null) + gui.px(section_gap);
+        _ = gui.paragraphAt(list, x, y, @min(width, gui.px(note_max_width)), theme.colors.text_secondary, i18n.t.scan.no_preview);
         return;
     };
     const index = state.selected orelse {
-        y += titleAt(list, x, y, "No frames", null) + gui.px(section_gap);
-        const why = state.detect_note orelse "Detect frames, or add them by hand";
-        y += gui.paragraphAt(list, x, y, @min(width, gui.px(note_max_width)), theme.text_secondary, why) + gui.px(section_gap);
+        y += titleAt(list, x, y, i18n.t.common.no_frames, null) + gui.px(section_gap);
+        const why = if (state.detect_note) |note| note.text() else i18n.t.scan.detect_or_add;
+        y += gui.paragraphAt(list, x, y, @min(width, gui.px(note_max_width)), theme.colors.text_secondary, why) + gui.px(section_gap);
         c.ImGui_SetCursorScreenPos(gui.vec2(x, y));
-        if (gui.buttonOf(.normal, "Add frame", gui.vec2(0, gui.button_height))) addFrame(state, ctx.gpa, preview, format);
+        if (gui.buttonOf(.normal, i18n.t.scan.add_frame, gui.vec2(0, gui.button_height))) addFrame(state, ctx.gpa, preview, format);
         return;
     };
     const box = &state.boxes.items[index];
@@ -1783,18 +1924,18 @@ fn drawFrameSection(state: *State, ctx: context.Context, roll_index: usize, list
     // The title: which frame, and its format.
     const shape_text = switch (box.shape) {
         .roll => labels.ratio(format.ratio()),
-        .free => "measured",
+        .free => i18n.t.scan.measured,
         .custom => labels.ratio(box.ratio),
     };
-    const rotated: []const u8 = if (preview.axis == .y) ", shown rotated" else "";
-    y += titleAt(list, x, y, gui.print("Frame {d}", .{index + 1}), gui.print("{s} · {s}{s}", .{ labels.filmAndName(format), shape_text, rotated })) + gui.px(section_gap);
+    const detail = if (preview.axis == .y) i18n.t.scan.frame_detail_rotated else i18n.t.scan.frame_detail;
+    y += titleAt(list, x, y, gui.say(i18n.t.scan.frame, .{index + 1}), gui.say(detail, .{ labels.filmAndName(format), shape_text })) + gui.px(section_gap);
 
     y += drawFrameView(state, preview, index, list, x, y, width) + gui.px(section_gap);
 
     c.ImGui_SetCursorScreenPos(gui.vec2(x, y));
     c.ImGui_BeginDisabled(state.scanning);
     var scanned = !box.skip;
-    if (gui.checkboxWith("Scan this frame", &scanned, .{ .gap = checkbox_gap, .height = gui.lineHeight(), .label_color = theme.text })) {
+    if (gui.checkboxWith(i18n.t.scan.scan_this_frame, &scanned, .{ .gap = checkbox_gap, .height = gui.lineHeight(), .label_color = theme.colors.text })) {
         box.skip = !scanned;
         state.boxes_dirty = true;
     }
@@ -1812,13 +1953,13 @@ fn drawFrameSection(state: *State, ctx: context.Context, roll_index: usize, list
 /// Draws the box's shape, inset, rotation and height controls at `top`. Returns the y below them.
 fn drawShapeControls(state: *State, box: *Box, preview: *const Preview, format: formats.Format, list: *c.ImDrawList, x: f32, top: f32, width: f32) f32 {
     var y = top;
-    y += gui.lineAt(list, x, y, theme.text_secondary, "Shape") + gui.px(group_gap);
+    y += gui.lineAt(list, x, y, theme.colors.text_secondary, i18n.t.scan.shape) + gui.px(group_gap);
     c.ImGui_PushID("shape");
     var shape_labels: [std.enums.values(Shape).len][:0]const u8 = undefined;
     for (&shape_labels, std.enums.values(Shape)) |*label, shape| label.* = switch (shape) {
-        .roll => gui.print("Roll format, {s}", .{labels.ratio(format.ratio())}),
-        .free => "Free",
-        .custom => "Custom ratio",
+        .roll => gui.say(i18n.t.scan.shape_roll, .{labels.ratio(format.ratio())}),
+        .free => i18n.t.scan.shape_free,
+        .custom => i18n.t.scan.shape_custom,
     };
     if (pillsOf(Shape, box.shape, &shape_labels, x, &y, width)) |picked| {
         box.shape = picked;
@@ -1831,16 +1972,16 @@ fn drawShapeControls(state: *State, box: *Box, preview: *const Preview, format: 
 
     // Inset, rotation, and the custom ratio.
     c.ImGui_PushID("sliders");
-    if (sliderRowAt(x, &y, width, "Inset", &box.inset, 0, max_inset, "{d:.1}%", 0, "Higher trims more off each side")) {
+    if (sliderRowAt(x, &y, width, "inset", i18n.t.scan.inset, &box.inset, 0, max_inset, "{d:.1}%", 0, i18n.t.scan.inset_help)) {
         markEdited(state, box);
     }
     y += gui.px(slider_gap);
-    if (sliderRowAt(x, &y, width, "Rotation", &box.rotation, -max_rotation, max_rotation, "{d:.1}°", box.detected_rotation, "Straightens a tilted frame · resets to the detected angle")) {
+    if (sliderRowAt(x, &y, width, "rotation", i18n.t.scan.rotation, &box.rotation, -max_rotation, max_rotation, "{d:.1}°", box.detected_rotation, i18n.t.scan.rotation_help)) {
         markEdited(state, box);
     }
     if (box.shape == .custom) {
         y += gui.px(slider_gap);
-        if (sliderRowAt(x, &y, width, "Ratio", &box.ratio, 0.5, 3, "{d:.2}", format.ratio(), "Width over height · resets to the roll's format")) {
+        if (sliderRowAt(x, &y, width, "ratio", i18n.t.scan.ratio, &box.ratio, 0.5, 3, "{d:.2}", format.ratio(), i18n.t.scan.ratio_help)) {
             reshape(box, preview, format);
             markEdited(state, box);
         }
@@ -1849,7 +1990,7 @@ fn drawShapeControls(state: *State, box: *Box, preview: *const Preview, format: 
     y += gui.px(section_gap);
 
     c.ImGui_SetCursorScreenPos(gui.vec2(x, y));
-    if (gui.checkboxWith("Full height of the opening", &box.full_height, .{ .gap = checkbox_gap, .height = gui.lineHeight(), .label_color = theme.text })) {
+    if (gui.checkboxWith(i18n.t.scan.full_height, &box.full_height, .{ .gap = checkbox_gap, .height = gui.lineHeight(), .label_color = theme.colors.text })) {
         if (!box.full_height) box.height = @min(box.height, format.height_mm * preview.acrossPerMm());
         reshape(box, preview, format);
         markEdited(state, box);
@@ -1862,13 +2003,14 @@ fn drawFrameTools(state: *State, ctx: context.Context, roll_index: usize, previe
     c.ImGui_SetCursorScreenPos(at);
     c.ImGui_BeginDisabled(state.scanning);
     c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_FramePadding, gui.vec2(gui.px(gui.button_padding), (gui.px(gui.button_height) - c.ImGui_GetFontSize()) / 2));
-    if (gui.buttonOf(.normal, "Add frame", gui.vec2(0, gui.button_height))) addFrame(state, ctx.gpa, preview, format);
+    if (gui.buttonOf(.normal, i18n.t.scan.add_frame, gui.vec2(0, gui.button_height))) addFrame(state, ctx.gpa, preview, format);
     c.ImGui_SameLineEx(0, gui.px(tool_gap));
-    if (gui.buttonOf(.normal, "Split", gui.vec2(0, gui.button_height))) splitFrame(state, ctx.gpa, index);
+    if (gui.buttonOf(.normal, i18n.t.scan.split, gui.vec2(0, gui.button_height))) splitFrame(state, ctx.gpa, index);
     c.ImGui_SameLineEx(0, gui.px(tool_gap));
-    if (gui.buttonOf(.normal, "Delete", gui.vec2(0, gui.button_height))) deleteFrame(state, index);
+    if (gui.iconButton("delete frame", .normal, .trash)) deleteFrame(state, index);
+    gui.tooltip(i18n.t.scan.delete_frame);
     c.ImGui_SameLineEx(0, gui.px(tool_gap));
-    if (gui.buttonOf(.secondary, "Detect again", gui.vec2(0, gui.button_height))) detect(state, ctx, roll_index);
+    if (gui.buttonOf(.secondary, i18n.t.scan.detect_again, gui.vec2(0, gui.button_height))) detect(state, ctx, roll_index);
     c.ImGui_PopStyleVar();
     c.ImGui_EndDisabled();
 }
@@ -1881,7 +2023,7 @@ fn drawFrameView(state: *State, preview: *Preview, index: usize, list: *c.ImDraw
     const pad = gui.px(frame_view_padding);
     const view_height = gui.px(frame_view_height);
     const total = view_height + 2 * pad;
-    c.ImDrawList_AddRectFilledEx(list, gui.vec2(x, y), gui.vec2(x + width, y + total), theme.imU32(theme.page), gui.px(frame_view_rounding), 0);
+    c.ImDrawList_AddRectFilledEx(list, gui.vec2(x, y), gui.vec2(x + width, y + total), theme.imU32(theme.colors.page), gui.px(frame_view_rounding), 0);
 
     // The region to show: the frame plus a little past each end, and the whole opening across.
     const across = @max(box.height, if (preview.opening(box.opening)) |o| o.height else box.height);
@@ -1900,11 +2042,11 @@ fn drawFrameView(state: *State, preview: *Preview, index: usize, list: *c.ImDraw
     const crop_min = gui.vec2(origin.x + crop_left * scale, origin.y + (crop.across - crop.height / 2 - (region.across - region.height / 2)) * scale);
     const crop_max = gui.vec2(crop_min.x + crop.length * scale, crop_min.y + crop.height * scale);
     const corners = rotatedCorners(crop_min, crop_max, box.rotation);
-    const ink = theme.imU32(if (box.check != null) theme.text else theme.accent);
+    const ink = theme.imU32(if (box.check != null) theme.colors.text else theme.colors.accent);
     if (box.check != null) {
         drawDashedQuad(list, corners, ink, gui.px(box_line));
     } else {
-        c.ImDrawList_AddQuadEx(list, corners[0], corners[1], corners[2], corners[3], ink, gui.px(box_line));
+        c.ImDrawList_AddQuadEx(list, corners[0], corners[1], corners[2], corners[3], ink, gui.px(box_line), 0);
     }
 
     // Dragging the crop moves the frame along the strip, and dragging a corner resizes it.
@@ -1912,7 +2054,7 @@ fn drawFrameView(state: *State, preview: *Preview, index: usize, list: *c.ImDraw
     c.ImGui_PushID("frame view");
     defer c.ImGui_PopID();
     for (corners, 0..) |p, k| {
-        c.ImDrawList_AddRectFilled(list, gui.vec2(p.x - handle / 2, p.y - handle / 2), gui.vec2(p.x + handle / 2, p.y + handle / 2), theme.imU32(theme.accent));
+        c.ImDrawList_AddRectFilled(list, gui.vec2(p.x - handle / 2, p.y - handle / 2), gui.vec2(p.x + handle / 2, p.y + handle / 2), theme.imU32(theme.colors.accent));
         c.ImGui_SetCursorScreenPos(gui.vec2(p.x - handle, p.y - handle));
         c.ImGui_PushIDInt(@intCast(k));
         _ = c.ImGui_InvisibleButton("corner", gui.vec2(2 * handle, 2 * handle), 0);
@@ -1947,7 +2089,7 @@ fn drawRegion(list: *c.ImDrawList, preview: *const Preview, region: Box, origin:
     const bottom = r[3] / h;
     const far = gui.vec2(origin.x + shown.x, origin.y + shown.y);
     // The film past the edge of the scan, where the region runs off it.
-    c.ImDrawList_AddRectFilled(list, origin, far, theme.imU32(theme.header));
+    c.ImDrawList_AddRectFilled(list, origin, far, theme.imU32(theme.colors.header));
     drawImage(list, texture.ref(), origin, far, .{ left, top, right, bottom }, preview.axis == .y);
 }
 
@@ -2045,8 +2187,8 @@ fn drawCheckNote(state: *const State, preview: *const Preview, index: usize, lis
     const box = state.boxes.items[index];
     const check = box.check orelse return 0;
     const message: []const u8 = switch (check) {
-        .cut => "Check · runs off the preview",
-        .length => "Check · length far from the format, measured box kept",
+        .cut => i18n.t.scan.check_cut,
+        .length => i18n.t.scan.check_length,
         .pitch => pitchNote(state, preview, index),
     };
     const pad_x = gui.px(check_note.padding_x);
@@ -2055,9 +2197,9 @@ fn drawCheckNote(state: *const State, preview: *const Preview, index: usize, lis
     const text_x = x + pad_x + icon + gui.px(check_note.icon_gap);
     const text_width = x + width - pad_x - text_x;
     const height = gui.paragraphHeight(message, text_width) + 2 * pad_y;
-    gui.dashedRect(list, gui.vec2(x, y), gui.vec2(x + width, y + height), theme.imU32(theme.text_secondary), 1, gui.px(dash), gui.px(dash_gap));
-    drawInfo(list, gui.vec2(x + pad_x, y + pad_y + (gui.lineHeight() - icon) / 2), icon, theme.text);
-    _ = gui.paragraphAt(list, text_x, y + pad_y, text_width, theme.text, message);
+    gui.dashedRect(list, gui.vec2(x, y), gui.vec2(x + width, y + height), theme.imU32(theme.colors.text_secondary), 1, gui.px(dash), gui.px(dash_gap));
+    drawInfo(list, gui.vec2(x + pad_x, y + pad_y + (gui.lineHeight() - icon) / 2), icon, theme.colors.text);
+    _ = gui.paragraphAt(list, text_x, y + pad_y, text_width, theme.colors.text, message);
     return height;
 }
 
@@ -2084,11 +2226,11 @@ fn pitchNote(state: *const State, preview: *const Preview, index: usize) []const
             break;
         }
     }
-    if (before == null and after == null) return "Check · faint edges, placed from the format's pitch";
-    const a = before orelse return "Check · faint edges, placed from the next frames' pitch";
-    const b = after orelse return "Check · faint edges, placed from the previous frames' pitch";
+    if (before == null and after == null) return i18n.t.scan.check_pitch_format;
+    const a = before orelse return i18n.t.scan.check_pitch_next;
+    const b = after orelse return i18n.t.scan.check_pitch_previous;
     const pitch = (boxes[b].along - boxes[a].along) / @as(f32, @floatFromInt(b - a)) / preview.alongPerMm();
-    return gui.print("Check · faint edges, placed from the {d:.0} mm pitch of frames {d} and {d}", .{ pitch, a + 1, b + 1 });
+    return gui.say(i18n.t.scan.check_pitch_frames, .{ mm0(pitch), a + 1, b + 1 });
 }
 
 fn addFrame(state: *State, gpa: std.mem.Allocator, preview: *const Preview, format: formats.Format) void {
@@ -2174,9 +2316,9 @@ fn detect(state: *State, ctx: context.Context, roll_index: ?usize) void {
     const format = ctx.library.rolls.items[r].info.format.format();
     var detection = frames.detect.detect(ctx.gpa, preview.scan, preview.dpi[0], format, state.film.detectKind(), .{ .holder = state.holder() }) catch |err| {
         state.detect_note = switch (err) {
-            error.NoOpening => "No film on the preview",
-            error.BadResolution => "Preview resolution unknown · preview again",
-            error.OutOfMemory => "Detection out of memory",
+            error.NoOpening => .no_opening,
+            error.BadResolution => .bad_resolution,
+            error.OutOfMemory => .out_of_memory,
         };
         keepHandBoxes(state);
         return;
@@ -2184,7 +2326,7 @@ fn detect(state: *State, ctx: context.Context, roll_index: ?usize) void {
     defer detection.deinit(ctx.gpa);
     const count = @min(detection.openings.len, max_openings);
     const openings = ctx.gpa.alloc(Opening, count) catch {
-        state.detect_note = "Detection out of memory";
+        state.detect_note = .out_of_memory;
         keepHandBoxes(state);
         return;
     };
@@ -2233,7 +2375,7 @@ fn detect(state: *State, ctx: context.Context, roll_index: ?usize) void {
         preview.texture = null;
         uploadPreview(state, ctx);
     };
-    state.detect_note = if (detection.frames.len == 0) "No frames found" else null;
+    state.detect_note = if (detection.frames.len == 0) .none_found else null;
     state.selected = if (state.boxes.items.len > 0) 0 else null;
     state.boxes_dirty = true;
     std.log.debug("detected {d} frames in {d} openings, {d} kept from hand edits; strip along {t}, opening {d:.1} mm", .{ detection.frames.len, count, state.boxes.items.len - added, detection.axis, detection.opening_mm });
@@ -2362,18 +2504,19 @@ fn drawQueue(state: *State, ctx: context.Context) ?context.Workspace {
     const width = size.x - 1 - gui.px(2 * panel_padding);
     var y = origin.y + gui.px(panel_padding);
 
-    y += gui.headingAt(list, x, y, "QUEUE") + gui.px(queue_gap);
+    y += gui.headingAt(list, x, y, i18n.t.scan.queue_heading) + gui.px(queue_gap);
     if (targetRoll(state, ctx)) |r| {
         const info = ctx.library.rolls.items[r].info;
-        y += gui.lineAt(list, x, y, theme.text, gui.print("Into {s} · {s}", .{ info.name, info.stock orelse labels.filmKind(info.kind) })) + gui.px(group_gap);
+        y += gui.lineAt(list, x, y, theme.colors.text, gui.say(i18n.t.scan.into_roll, .{ info.name, info.stock orelse labels.filmKind(info.kind) })) + gui.px(group_gap);
     }
     const queued = state.scanning or state.queue.items.len > 0;
     const count = if (queued) state.queue.items.len else state.boxes.items.len;
     var scanned: usize = 0;
     for (0..count) |i| scanned += @intFromBool(queueItemAt(state, queued, i) != .skipped);
     const deep = if (state.capabilities) |caps| caps.deep else true;
-    const summary = gui.print("{d} {s} · {d} dpi · {d}-bit", .{ scanned, if (scanned == 1) "frame" else "frames", state.dpi, @as(u32, if (deep) 48 else 24) });
-    y += gui.lineAt(list, x, y, theme.text_secondary, summary) + gui.px(queue_gap);
+    const bits: u32 = if (deep) 48 else 24;
+    const summary = if (scanned == 1) gui.say(i18n.t.scan.queue_one_frame, .{ state.dpi, bits }) else gui.say(i18n.t.scan.queue_frames, .{ scanned, state.dpi, bits });
+    y += gui.lineAt(list, x, y, theme.colors.text_secondary, summary) + gui.px(queue_gap);
 
     const worker = state.worker;
     for (0..count) |i| {
@@ -2388,7 +2531,7 @@ fn drawQueue(state: *State, ctx: context.Context) ?context.Workspace {
             const same = open != null and std.mem.eql(u8, open.?, path);
             const opened = same or if (ctx.develop.openRoll(ctx.gpa, ctx.io, ctx.library, path)) true else |err| failed: {
                 std.log.err("can't open the roll: {t}", .{err});
-                ctx.notice.set("Roll not found", .{});
+                ctx.notice.set("{s}", .{i18n.t.scan.roll_not_found});
                 break :failed false;
             };
             if (opened) {
@@ -2402,7 +2545,7 @@ fn drawQueue(state: *State, ctx: context.Context) ?context.Workspace {
     c.ImGui_SetCursorScreenPos(gui.vec2(x, y));
     const finishing = if (worker) |w| w.phase.load(.acquire) == .finishing else false;
     c.ImGui_BeginDisabled(!state.scanning or finishing);
-    if (gui.buttonOf(.outline, if (finishing) "Finishing frame…" else "Cancel", gui.vec2(width / gui.scale, cancel_height))) {
+    if (gui.buttonOf(.outline, if (finishing) i18n.t.scan.finishing_frame else i18n.t.common.cancel, gui.vec2(width / gui.scale, cancel_height))) {
         if (worker) |w| w.cancelQueue();
     }
     c.ImGui_EndDisabled();
@@ -2435,36 +2578,36 @@ fn drawQueueRow(list: *c.ImDrawList, x: f32, y: f32, width: f32, index: usize, i
         .waiting, .skipped, .cancelled => false,
         .scanning, .checking, .done, .check_crop, .failed => true,
     };
-    if (filled) c.ImDrawList_AddRectFilledEx(list, gui.vec2(x, y), gui.vec2(x + width, y + height), theme.imU32(theme.raised), gui.px(gui.control_rounding), 0);
-    if (running) c.ImDrawList_AddRectFilledEx(list, gui.vec2(x, y), gui.vec2(x + gui.px(running_bar), y + height), theme.imU32(theme.accent), gui.px(gui.control_rounding), c.ImDrawFlags_RoundCornersLeft);
+    if (filled) c.ImDrawList_AddRectFilledEx(list, gui.vec2(x, y), gui.vec2(x + width, y + height), theme.imU32(theme.colors.raised), gui.px(gui.control_rounding), 0);
+    if (running) c.ImDrawList_AddRectFilledEx(list, gui.vec2(x, y), gui.vec2(x + gui.px(running_bar), y + height), theme.imU32(theme.colors.accent), gui.px(gui.control_rounding), c.ImDrawFlags_RoundLeft);
 
-    const ink = if (filled) theme.text else if (item == .skipped) theme.text_tertiary else theme.text_secondary;
+    const ink = if (filled) theme.colors.text else if (item == .skipped) theme.colors.text_tertiary else theme.colors.text_secondary;
     const text_y = y + pad_y + (line - c.ImGui_GetFontSize()) / 2;
     fonts.push(.mono);
     c.ImDrawList_AddText(list, gui.vec2(x + pad_x, text_y), theme.imU32(ink), gui.print("{d}", .{index + 1}));
     fonts.pop();
     const finishing = if (worker) |w| w.phase.load(.acquire) == .finishing else false;
     const label: []const u8 = switch (item) {
-        .waiting => "Waiting",
-        .skipped => "Skipped",
-        .scanning => if (finishing) "Finishing" else if (worker != null and worker.?.progress.total.load(.acquire) == 0) "Starting" else "Scanning",
-        .checking => "Checking edges",
-        .done => "Scanned, base measured",
-        .check_crop => "Scanned · crop to check",
-        .failed => |err| gui.print("Failed: {s}", .{errorText(err)}),
-        .cancelled => "Canceled",
+        .waiting => i18n.t.scan.waiting,
+        .skipped => i18n.t.scan.skipped,
+        .scanning => if (finishing) i18n.t.scan.finishing_scan else if (worker != null and worker.?.progress.total.load(.acquire) == 0) i18n.t.scan.starting else i18n.t.scan.scanning_frame,
+        .checking => i18n.t.scan.checking_edges,
+        .done => i18n.t.scan.scanned,
+        .check_crop => i18n.t.scan.scanned_check_crop,
+        .failed => |err| gui.say(i18n.t.scan.failed, .{errorText(err)}),
+        .cancelled => i18n.t.scan.canceled,
     };
     const text_x = x + pad_x + gui.px(number_column + queue_text_gap);
     c.ImDrawList_AddText(list, gui.vec2(text_x, text_y), theme.imU32(ink), gui.elideEnd(label, x + width - pad_x - text_x - gui.px(queue_right_room)));
     const right = x + width - pad_x;
     var check = false;
     switch (item) {
-        .done => drawTick(list, gui.vec2(right - gui.px(tick.size), y + pad_y + (line - gui.px(tick.size)) / 2), theme.ready),
+        .done => drawTick(list, gui.vec2(right - gui.px(tick.size), y + pad_y + (line - gui.px(tick.size)) / 2), theme.colors.ready),
         // Its edges weren't found again on the scan, so show a link to the frame's crop in
         // Develop. The link works while the rest of the queue scans, since the frame is already in
         // the roll.
         .check_crop => {
-            const link = "Check";
+            const link = i18n.t.scan.check;
             const link_width = c.ImGui_CalcTextSize(link).x;
             const link_at = gui.vec2(right - link_width, text_y);
             c.ImGui_SetCursorScreenPos(gui.vec2(link_at.x - gui.px(link_padding), y));
@@ -2472,15 +2615,15 @@ fn drawQueueRow(list: *c.ImDrawList, x: f32, y: f32, width: f32, index: usize, i
             const hovered = c.ImGui_IsItemHovered(0);
             if (hovered) {
                 c.ImGui_SetMouseCursor(c.ImGuiMouseCursor_Hand);
-                gui.showTooltip("Edges not found");
+                gui.showTooltip(i18n.t.scan.edges_not_found);
             }
-            c.ImDrawList_AddText(list, link_at, theme.imU32(if (hovered) theme.text else theme.accent), link);
+            c.ImDrawList_AddText(list, link_at, theme.imU32(if (hovered) theme.colors.text else theme.colors.accent), link);
         },
         .scanning => |started| {
             const seconds = (c.SDL_GetTicks() -| started) / 1000;
             fonts.push(.mono);
             const time = gui.print("{d}:{d:0>2}", .{ seconds / 60, seconds % 60 });
-            c.ImDrawList_AddText(list, gui.vec2(right - c.ImGui_CalcTextSize(time).x, text_y), theme.imU32(theme.text_secondary), time);
+            c.ImDrawList_AddText(list, gui.vec2(right - c.ImGui_CalcTextSize(time).x, text_y), theme.imU32(theme.colors.text_secondary), time);
             fonts.pop();
             const bar_y = y + pad_y + line + gui.px(group_gap);
             const done = if (worker) |w| w.progress.fraction() else 0;
@@ -2493,13 +2636,13 @@ fn drawQueueRow(list: *c.ImDrawList, x: f32, y: f32, width: f32, index: usize, i
 
 fn errorText(e: anyerror) []const u8 {
     return switch (e) {
-        error.Busy => "scanner busy",
-        error.Jammed => "jammed",
-        error.CoverOpen => "cover open",
-        error.Unsupported => "not supported",
+        error.Busy => i18n.t.scan.errors.busy,
+        error.Jammed => i18n.t.scan.errors.jammed,
+        error.CoverOpen => i18n.t.scan.errors.cover_open,
+        error.Unsupported => i18n.t.scan.errors.unsupported,
         error.InfraredCorrectionRejectedOriginalSaved => "IR mask rejected; original saved",
-        error.OutOfMemory => "out of memory",
-        error.NotFound => "scanner gone",
+        error.OutOfMemory => i18n.t.scan.errors.out_of_memory,
+        error.NotFound => i18n.t.scan.errors.not_found,
         else => @errorName(e),
     };
 }
@@ -2540,7 +2683,7 @@ fn keepPreview(ctx: context.Context, folder: []const u8, picture: scan_worker.Pr
     defer ctx.gpa.free(json);
     cwd.writeFile(ctx.io, .{ .sub_path = image_path, .data = bytes }) catch |err| return std.log.err("can't keep the preview: {t}", .{err});
     cwd.writeFile(ctx.io, .{ .sub_path = settings_path, .data = json }) catch |err| return std.log.err("can't keep the preview: {t}", .{err});
-    ctx.notice.set("Preview kept with its roll", .{});
+    ctx.notice.set("{s}", .{i18n.t.scan.preview_kept});
 }
 
 /// Which way a preview's strip runs: along its longer side.
@@ -2658,10 +2801,10 @@ fn titleAt(list: *c.ImDrawList, x: f32, y: f32, title: [:0]const u8, detail: ?[:
     const title_size = c.ImGui_CalcTextSize(title);
     const height = gui.lineHeight();
     const title_top = y + (height - c.ImGui_GetFontSize()) / 2;
-    c.ImDrawList_AddText(list, gui.vec2(x, title_top), theme.imU32(theme.text), title);
+    c.ImDrawList_AddText(list, gui.vec2(x, title_top), theme.imU32(theme.colors.text), title);
     const baseline = title_top + c.ImGui_GetFontSize() * baseline_share;
     fonts.pop();
-    if (detail) |d| c.ImDrawList_AddText(list, gui.vec2(x + title_size.x + gui.px(title_detail_gap), baseline - c.ImGui_GetFontSize() * baseline_share), theme.imU32(theme.text_secondary), d);
+    if (detail) |d| c.ImDrawList_AddText(list, gui.vec2(x + title_size.x + gui.px(title_detail_gap), baseline - c.ImGui_GetFontSize() * baseline_share), theme.imU32(theme.colors.text_secondary), d);
     return height;
 }
 
@@ -2674,10 +2817,10 @@ fn pillsOf(comptime T: type, chosen: T, labels_: *const [std.enums.values(T).len
     return choices[picked];
 }
 
-/// The labels of every value of enum `T`, in order, from its `label` function.
-fn labelsOf(comptime T: type) [std.enums.values(T).len][:0]const u8 {
+/// The labels of every value of enum `T`, in order, from `labelOf`.
+fn labelsOf(comptime T: type, comptime labelOf: fn (T) [:0]const u8) [std.enums.values(T).len][:0]const u8 {
     var out: [std.enums.values(T).len][:0]const u8 = undefined;
-    for (&out, std.enums.values(T)) |*label, value| label.* = value.label();
+    for (&out, std.enums.values(T)) |*label, value| label.* = labelOf(value);
     return out;
 }
 
@@ -2706,28 +2849,29 @@ fn pills(labels_: []const [:0]const u8, chosen: usize, x: f32, y: *f32, width: f
 }
 
 /// Draws a slider row for the frame tools: a 110-pixel label, the slider with `help` as its
-/// tooltip, the value in a 56-pixel column, and a button that resets it to `default`. Moves `y`
-/// past it. Returns true when the value changed.
-fn sliderRowAt(x: f32, y: *f32, width: f32, label: []const u8, value: *f32, min: f32, max: f32, comptime format: []const u8, default: f32, help: [:0]const u8) bool {
+/// tooltip, the value in a 56-pixel column, and a button that resets it to `default`. `id` keeps
+/// the slider the same widget in any language. Moves `y` past it. Returns true when the value
+/// changed.
+fn sliderRowAt(x: f32, y: *f32, width: f32, id: [:0]const u8, label: []const u8, value: *f32, min: f32, max: f32, comptime format: []const u8, default: f32, help: [:0]const u8) bool {
     // A range input is 20 pixels high in the design, and the slider fills the row.
     const height = gui.px(slider_row_height);
     c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_FramePadding, gui.vec2(gui.px(slider_spacing), (height - c.ImGui_GetFontSize()) / 2));
     defer c.ImGui_PopStyleVar();
     const list = c.ImGui_GetWindowDrawList();
-    _ = gui.lineAt(list, x, y.* + (height - gui.lineHeight()) / 2, theme.text_secondary, label);
+    _ = gui.lineAt(list, x, y.* + (height - gui.lineHeight()) / 2, theme.colors.text_secondary, label);
     const slider_x = x + gui.px(slider_label_column + slider_spacing);
     const slider_width = width - gui.px(slider_label_column + 2 * slider_spacing + slider_value_column + gui.reset_space);
     c.ImGui_SetCursorScreenPos(gui.vec2(slider_x, y.*));
-    var changed = gui.slider(gui.print("{s}", .{label}), value, min, max, slider_width / gui.scale);
+    var changed = gui.slider(id, value, min, max, slider_width / gui.scale);
     gui.tooltip(help);
     fonts.push(.mono);
     const shown = gui.formatSigned(format, value.*);
     const shown_width = c.ImGui_CalcTextSize(shown).x;
     const value_right = x + width - gui.px(gui.reset_space);
-    c.ImDrawList_AddText(list, gui.vec2(value_right - shown_width, y.* + (height - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.text), shown);
+    c.ImDrawList_AddText(list, gui.vec2(value_right - shown_width, y.* + (height - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.colors.text), shown);
     fonts.pop();
     const reset_at = gui.vec2(x + width - gui.px(gui.reset_size), y.* + (height - gui.px(gui.reset_size)) / 2);
-    if (gui.resetButton(gui.print("reset {s}", .{label}), reset_at, shown, gui.formatSigned(format, default))) {
+    if (gui.resetButton(gui.print("reset {s}", .{id}), reset_at, shown, gui.formatSigned(format, default))) {
         value.* = default;
         changed = true;
     }
@@ -2746,7 +2890,7 @@ const tick = struct {
 fn drawTick(list: *c.ImDrawList, corner: gui.Vec2, color: theme.Color) void {
     var points: [tick.points.len]gui.Vec2 = undefined;
     for (&points, tick.points) |*p, at| p.* = gui.vec2(corner.x + gui.px(at[0]), corner.y + gui.px(at[1]));
-    for (points[0 .. points.len - 1], points[1..]) |from, to| c.ImDrawList_AddLineEx(list, from, to, theme.imU32(color), gui.px(tick.stroke));
+    for (points[0 .. points.len - 1], points[1..]) |from, to| c.ImDrawList_AddLineEx(list, from, to, theme.imU32(color), gui.px(tick.stroke), 0);
 }
 
 /// The "i" in a circle, in a 16-unit box: the circle, the stem and the dot, and the stroke.
@@ -2766,9 +2910,9 @@ fn drawInfo(list: *c.ImDrawList, corner: gui.Vec2, size: f32, color: theme.Color
     const ink = theme.imU32(color);
     const unit = size / info_icon.box;
     const centre = gui.vec2(corner.x + info_icon.box / 2 * unit, corner.y + info_icon.box / 2 * unit);
-    c.ImDrawList_AddCircleEx(list, centre, info_icon.radius * unit, ink, info_icon.segments, info_icon.stroke * unit);
-    c.ImDrawList_AddLineEx(list, gui.vec2(centre.x, corner.y + info_icon.stem_top * unit), gui.vec2(centre.x, corner.y + info_icon.stem_bottom * unit), ink, info_icon.stroke * unit);
-    c.ImDrawList_AddLineEx(list, gui.vec2(centre.x, corner.y + info_icon.dot_top * unit), gui.vec2(centre.x, corner.y + info_icon.dot_bottom * unit), ink, info_icon.stroke * unit);
+    c.ImDrawList_AddCircleEx(list, centre, info_icon.radius * unit, ink, info_icon.segments, info_icon.stroke * unit, 0);
+    c.ImDrawList_AddLineEx(list, gui.vec2(centre.x, corner.y + info_icon.stem_top * unit), gui.vec2(centre.x, corner.y + info_icon.stem_bottom * unit), ink, info_icon.stroke * unit, 0);
+    c.ImDrawList_AddLineEx(list, gui.vec2(centre.x, corner.y + info_icon.dot_top * unit), gui.vec2(centre.x, corner.y + info_icon.dot_bottom * unit), ink, info_icon.stroke * unit, 0);
 }
 
 /// The dashes of a box to check, and the gaps between them.
@@ -3051,4 +3195,63 @@ test "detecting again keeps only the boxes edited by hand" {
     state.boxes.items[1].hand = false;
     keepHandBoxes(&state);
     try std.testing.expectEqual(@as(?usize, null), state.selected);
+}
+
+test "a native resolution survives reopen only while the source still offers both axes" {
+    var caps: scan.Capabilities = .{ .sources = .initOne(.transparency), .source = .transparency, .resolutions = @constCast(&[_]u32{ 300, 2400 }), .axis_resolutions = .{ @constCast(&[_]u32{ 300, 2400, 6400 }), @constCast(&[_]u32{ 300, 2400, 9600 }) }, .area = default_film_area, .deep = true, .film_setting = false, .profile = null };
+    var state: State = .{ .dpi = 6400, .dpi_y = 9600 };
+    validateDpi(&state, caps, 2400);
+    try std.testing.expectEqual(@as(u32, 6400), state.dpi);
+    try std.testing.expectEqual(@as(?u32, 9600), state.dpi_y);
+    caps.source = .flatbed;
+    caps.axis_resolutions = null;
+    validateDpi(&state, caps, 2400);
+    try std.testing.expectEqual(@as(u32, 2400), state.dpi);
+    try std.testing.expectEqual(@as(?u32, null), state.dpi_y);
+    // A device with axes but without the old Y value also clears the override.
+    state.dpi_y = 9600;
+    caps.axis_resolutions = .{ @constCast(&[_]u32{ 300, 2400 }), @constCast(&[_]u32{ 300, 2400 }) };
+    validateDpi(&state, caps, 300);
+    try std.testing.expectEqual(@as(u32, 2400), state.dpi);
+    try std.testing.expectEqual(@as(?u32, null), state.dpi_y);
+}
+
+test "rectangular storage estimates count native and square-pixel TIFFs" {
+    try std.testing.expectEqual(@as(u64, 90), captureBytes(2, 3, .{ 6400, 9600 }));
+    try std.testing.expectEqual(@as(u64, 90), captureBytes(3, 2, .{ 9600, 6400 }));
+    try std.testing.expectEqual(@as(u64, 36), captureBytes(2, 3, .{ 6400, 6400 }));
+}
+
+test "native archive write failure still persists the working frame crop and turns" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const folder = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(folder);
+    var r = try roll.Roll.create(gpa, io, folder, .{ .name = "Native failure" });
+    defer r.close();
+    const blocked = try std.fs.path.join(gpa, &.{ r.path, roll.scans_dir, "01.tif.native.tiff" });
+    defer gpa.free(blocked);
+    try std.Io.Dir.cwd().createDir(io, blocked, .default_dir);
+    var picture = try image.Scan.init(gpa, 3, 3);
+    defer picture.deinit(gpa);
+    @memset(picture.pixels, .{ 1000, 2000, 3000 });
+    const ppm = try minilab.pnm.write(gpa, u16, picture);
+    defer gpa.free(ppm);
+    const crop: image.Area = .{ .x = 1, .y = 0, .width = 2, .height = 3 };
+    const done: scan_worker.Scanned = .{ .index = 0, .ppm = ppm, .dpi = 9600, .native_tiff = @constCast("not written"), .capture_dpi = .{ 6400, 9600 }, .crop = crop, .refined = false };
+    const stored = try storeFrame(&r, gpa, io, done, 1);
+    try std.testing.expect(stored.native_failed);
+    var reopened = try roll.Roll.open(gpa, io, r.path);
+    defer reopened.close();
+    const saved = reopened.frames.items[stored.frame];
+    try std.testing.expectEqual(crop, saved.crop.?);
+    try std.testing.expectEqual(@as(u2, 1), saved.quarter_turns);
+    try std.testing.expectEqual(@as(?[]const u8, null), saved.native_scan);
+    const saved_path = try reopened.scanPath(gpa, stored.frame);
+    defer gpa.free(saved_path);
+    var raw = try minilab.input.read(gpa, io, saved_path);
+    defer raw.deinit(gpa);
+    try std.testing.expectEqualSlices([3]u16, picture.pixels, raw.scan.pixels);
 }

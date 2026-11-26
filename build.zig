@@ -67,8 +67,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{ .name = "minilab", .root_module = app });
     b.installArtifact(exe);
 
-    // Epson's optional Linux command library lives outside the app. A small child
-    // process contains driver failures and streams separate RGB and IR captures.
+    // The V600 SDK helper keeps proprietary driver failures outside the app.
     var infrared_helper: ?*std.Build.Step.Compile = null;
     if (target.result.os.tag == .linux) {
         const helper_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libcpp = true });
@@ -77,8 +76,8 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(helper);
         infrared_helper = helper;
     }
-
     addSteps(b, exe, &.{ core, app, looks.tool }, infrared_helper);
+    addTranslationTemplate(b);
     addApp(b, exe, target);
 }
 
@@ -107,6 +106,17 @@ fn cModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     translator.linkLibrary(sdl);
     for (interfaceIncludes(b)) |include| translator.addIncludePath(include);
     return translator.mod;
+}
+
+/// Adds `zig build translation-template`, which prints every message in English as a language
+/// file to start a translation from (docs/translating.md).
+fn addTranslationTemplate(b: *std.Build) void {
+    const template = b.addExecutable(.{
+        .name = "translation-template",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/i18n/template.zig"), .target = b.graph.host }),
+    });
+    const run = b.addRunArtifact(template);
+    b.step("translation-template", "Print every message in English, as a language file to translate").dependOn(&run.step);
 }
 
 /// Adds `zig build run`, which runs `exe`, and `zig build test` and `zig build check` for the
@@ -289,18 +299,27 @@ fn bakeLooks(b: *std.Build) struct { baked: std.Build.LazyPath, tool: *std.Build
     return .{ .baked = baked, .tool = tool };
 }
 
-/// Adds the fonts built into the app: IBM Plex Sans for the interface and JetBrains Mono for
-/// values.
+/// Adds the fonts built into the app: IBM Plex Sans for the interface, JetBrains Mono for values,
+/// and Lucide's icons.
 fn addFonts(b: *std.Build, module: *std.Build.Module) void {
     const plex = b.dependency("plex_sans", .{});
     const mono = b.dependency("jetbrains_mono", .{});
+    const lucide = b.dependency("lucide", .{});
     for ([_]struct { []const u8, std.Build.LazyPath }{
         .{ "IBMPlexSans-Regular.ttf", plex.path("fonts/complete/ttf/IBMPlexSans-Regular.ttf") },
         .{ "IBMPlexSans-SemiBold.ttf", plex.path("fonts/complete/ttf/IBMPlexSans-SemiBold.ttf") },
         .{ "JetBrainsMono-Regular.ttf", mono.path("fonts/ttf/JetBrainsMono-Regular.ttf") },
+        .{ "lucide.ttf", lucide.path("font/lucide.ttf") },
     }) |font| module.addAnonymousImport(font[0], .{ .root_source_file = font[1] });
+    // The icons' codepoints, from the font's own list, so they follow Lucide's numbering.
+    const icons = b.createModule(.{ .root_source_file = b.path("src/bake_icons.zig"), .target = b.graph.host });
+    const bake = b.addRunArtifact(b.addExecutable(.{ .name = "bake_icons", .root_module = icons }));
+    const codepoints = bake.addOutputFileArg("lucide_codepoints.zig");
+    bake.addFileArg(lucide.path("font/info.json"));
+    module.addAnonymousImport("lucide_codepoints", .{ .root_source_file = codepoints });
     for ([_]struct { std.Build.LazyPath, []const u8 }{
         .{ plex.path("LICENSE.txt"), "LICENSE-ibm-plex.txt" },
         .{ mono.path("OFL.txt"), "LICENSE-jetbrains-mono.txt" },
+        .{ lucide.path("LICENSE"), "LICENSE-lucide.txt" },
     }) |notice| b.getInstallStep().dependOn(&b.addInstallFile(notice[0], notice[1]).step);
 }

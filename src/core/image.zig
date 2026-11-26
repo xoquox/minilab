@@ -197,6 +197,8 @@ pub fn downscale(gpa: std.mem.Allocator, scan: Scan, longest: usize) !Scan {
 
 /// A scan: linear transmission, 16 bits per channel.
 pub const Scan = Image([channel_count]u16);
+/// One channel of a scan on its own, like an infrared plane: linear transmission, 16-bit.
+pub const Plane = Image([1]u16);
 /// A rendered image in 0..1, before encoding.
 pub const Rendered = Image([channel_count]f32);
 /// An encoded image, 8 bits per channel.
@@ -315,18 +317,19 @@ test "a very long thin scan still downscales to a picture" {
 /// Makes square pixels at the higher sampling density. Only the less-dense axis grows;
 /// native scanner samples are archived separately before this working copy is made.
 pub fn squarePixels(gpa: std.mem.Allocator, source: Scan, dpi: [2]f32) !Scan {
+    const pixel_centre = 0.5;
     const target = @max(dpi[0], dpi[1]);
     if (!std.math.isFinite(dpi[0]) or !std.math.isFinite(dpi[1]) or dpi[0] <= 0 or dpi[1] <= 0 or source.width == 0 or source.height == 0) return error.InvalidResolution;
     const width: usize = @max(1, @as(usize, @intFromFloat(@round(@as(f64, @floatFromInt(source.width)) * target / dpi[0]))));
     const height: usize = @max(1, @as(usize, @intFromFloat(@round(@as(f64, @floatFromInt(source.height)) * target / dpi[1]))));
     var result = try Scan.init(gpa, width, height);
     for (0..height) |y| {
-        const sy = std.math.clamp((@as(f64, @floatFromInt(y)) + 0.5) * @as(f64, @floatFromInt(source.height)) / @as(f64, @floatFromInt(height)) - 0.5, 0, @as(f64, @floatFromInt(source.height - 1)));
+        const sy = std.math.clamp((@as(f64, @floatFromInt(y)) + pixel_centre) * @as(f64, @floatFromInt(source.height)) / @as(f64, @floatFromInt(height)) - pixel_centre, 0, @as(f64, @floatFromInt(source.height - 1)));
         const y0: usize = @intFromFloat(sy);
         const y1 = @min(y0 + 1, source.height - 1);
         const fy = sy - @as(f64, @floatFromInt(y0));
         for (result.row(y), 0..) |*pixel, x| {
-            const sx = std.math.clamp((@as(f64, @floatFromInt(x)) + 0.5) * @as(f64, @floatFromInt(source.width)) / @as(f64, @floatFromInt(width)) - 0.5, 0, @as(f64, @floatFromInt(source.width - 1)));
+            const sx = std.math.clamp((@as(f64, @floatFromInt(x)) + pixel_centre) * @as(f64, @floatFromInt(source.width)) / @as(f64, @floatFromInt(width)) - pixel_centre, 0, @as(f64, @floatFromInt(source.width - 1)));
             const x0: usize = @intFromFloat(sx);
             const x1 = @min(x0 + 1, source.width - 1);
             const fx = sx - @as(f64, @floatFromInt(x0));

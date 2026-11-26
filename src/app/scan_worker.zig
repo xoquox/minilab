@@ -489,7 +489,7 @@ fn finish(gpa: std.mem.Allocator, job: FrameJob, captured: scan.Image) !Scanned 
     if (captured.infrared) |ir| {
         if (captured.dpi[0] != captured.dpi[1]) return error.Unsupported;
         infrared_pgm = try minilab.pnm.writeGray(gpa, ir);
-        const cleaned = minilab.infrared.clean(gpa, captured.scan, ir, captured.dpi[0]) catch |err| switch (err) {
+        const cleaned = minilab.sdk_infrared.clean(gpa, captured.scan, ir, captured.dpi[0]) catch |err| switch (err) {
             error.UnreliableInfrared => null,
             else => return err,
         };

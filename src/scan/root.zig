@@ -253,6 +253,13 @@ pub const Capabilities = struct {
     /// Separate RGB and infrared capture through the optional Epson helper.
     infrared: bool = false,
 
+    /// Whether the current source offers each requested axis without rounding.
+    pub fn hasAxisResolution(capabilities: Capabilities, dpi: [2]u32) bool {
+        const axes = capabilities.axis_resolutions orelse return false;
+        return std.mem.indexOfScalar(u32, axes[0], dpi[0]) != null and
+            std.mem.indexOfScalar(u32, axes[1], dpi[1]) != null;
+    }
+
     pub fn deinit(capabilities: *Capabilities, gpa: std.mem.Allocator) void {
         gpa.free(capabilities.resolutions);
         if (capabilities.axis_resolutions) |axes| for (axes) |values| gpa.free(values);
@@ -462,6 +469,8 @@ pub const RawValue = union(enum) {
 /// An option and what raw setup sets it to. The scanner settings keep the user's changes in
 /// the same form.
 pub const RawSetting = struct {
+    pub const json_identity = .{"name"};
+
     name: []const u8,
     value: RawValue,
 };

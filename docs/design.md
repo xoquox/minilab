@@ -63,11 +63,11 @@ What's in:
 - all common film sizes and formats, with one format per roll;
 - automatic frame detection that keeps the format's aspect ratio, plus boxes drawn by hand;
 - dust removal from the scan itself, for any scanner or camera, without an infrared channel;
+- dust removal with an infrared plane, for scans that come with one ([infrared.md](infrared.md));
 - macOS, Linux and Windows, each on x86-64 and Arm.
 
 What's out, at least for now:
 
-- dust and scratch removal with an infrared channel (the V200 doesn't have one);
 - grain, halation and other film simulation effects;
 - stitching several camera shots of one medium format frame.
 
@@ -133,8 +133,19 @@ The GUI has five workspaces. They're mocked up in the "minilab GUI" design canva
 
 The steps for a roll on a scanner:
 
-1. **New roll.** Film type, stock (optional), format, camera, lens, date and notes. These are
-   saved in the roll's folder (section 11).
+1. **New roll.** Film type, stock (optional), format, camera, lens, the date it was shot,
+   copyright and notes. These are saved in the roll's folder (section 11).
+   - Camera, lens and copyright suggest the values the library's other rolls have, newest roll
+     first: pick one from the field's list, or type the start of one and press Tab. There's no
+     list of their own to keep: they come from the rolls, so they follow the library wherever it
+     goes. Export's details suggest them the same way.
+   - The date shot starts as today, in the computer's time zone. Type a year, a month or a day
+     (YYYY, YYYY-MM or YYYY-MM-DD), since you don't always know the day, or pick a day on the
+     calendar at the end of the field. Export's date shot has the same calendar.
+   - The copyright starts as the newest roll's. Before any roll has one, it starts as the full
+     name of your account on the computer.
+   - To change them later, the pencil on a roll's card (shown while the mouse is over it) opens
+     the roll's details in the same panel. Each one is saved when you leave its box.
 2. **Preview.** Scan the scanner's whole film area at low resolution.
    - On the V200 that's the 33.02 × 244.348 mm transparency window (the backend's `-x` and `-y`
      range). For comparison, Epson's own software previews a strip at 384 × 2885 px, 300 dpi.
@@ -244,7 +255,7 @@ choice that says so, or the gamma tables filled with a straight line), colour co
 brightness and contrast to 0 where 0 is the middle of their range. An option the scanner won't
 take is skipped and logged. On the V200 this gives the same data as its profile.
 
-The Scanner settings window on Scan sets any of those options another way, per scanner and driver,
+The Scanner page of Settings sets any of those options another way, per scanner and driver,
 for when raw setup guesses wrong. The changes are kept in the library's `scanners.json`.
 
 A scanner that can't give linear data at all could still be used if we undid its curve: a scan of
@@ -557,6 +568,10 @@ export from the frame at the size it's saved at. Thumbnails are usually too smal
 then they stay as they are. A finished picture, such as a lab's scan, is already a positive,
 usually of a negative, so there dust is lighter than around it, and that's what it looks for.
 
+A scan that comes with an infrared plane can find its dust from that instead, with nothing to
+guess: [infrared.md](infrared.md) explains it. It shares this fill for the defects too dense to
+bring back.
+
 The idea comes from Tea and Tech Time's [automatic sensor dust
 removal](https://teaandtechtime.com/automatic-sensor-dust-removal/), for digital camera pictures:
 threshold against the neighbourhood, merge busy areas into big blobs, and fill the small blobs that
@@ -750,6 +765,10 @@ Rolls/
     exports/
 ```
 
+The app's own preferences, such as its appearance, aren't in the library: they belong to your
+account and go in `preferences.json` in its settings folder ([settings.md](settings.md)). The interface's text is in `src/i18n`, in English and each
+language it's translated into ([translating.md](translating.md)).
+
 **Why TIFF for raw scans.** Your raw scans are your archive, so they shouldn't be locked into
 minilab. A 16-bit TIFF with ZIP compression (Deflate with the horizontal predictor) loses
 nothing, and Lightroom, Photoshop, Capture One and Apple Photos all open it. It's also what
@@ -781,6 +800,7 @@ write both in Zig: we only need a handful of tags, and exiv2, the usual library 
 | translate-c package | turns C headers into a Zig module | MIT |
 | SDL3 (castholm/SDL's Zig build) | window, input, GPU (Metal, Vulkan, D3D12) | zlib |
 | IBM Plex Sans, JetBrains Mono | the interface's fonts | SIL OFL 1.1 |
+| Lucide 0.460.0 (its icon font) | the interface's icons | ISC, with parts from Feather under MIT |
 | sane-backends 1.4.0: libsane and its backends (carried by the macOS release, the system's elsewhere; loaded when minilab runs) | scanners on macOS and Linux | GPL-2.0+ with SANE's exception, 15 backends GPL-2.0 alone (section 13); `sane.h` public domain |
 | libusb 1.0.30, libjpeg-turbo 3.2.0 (carried by the macOS release, for SANE) | USB, and JPEG for the backends that need it | LGPL-2.1+; IJG and BSD |
 | our epkowa build and `libesint7A` | the V200, unchanged, loaded by libsane | GPL-2.0+ |

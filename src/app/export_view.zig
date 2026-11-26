@@ -13,8 +13,9 @@ const context = @import("context.zig");
 const shortcuts = @import("shortcuts.zig");
 const labels = @import("labels.zig");
 const Library = @import("library.zig").Library;
-const saved_details = @import("saved_details.zig");
 const Dialog = @import("../platform/file_dialog.zig").Dialog;
+const roll_details = @import("roll_details.zig");
+const i18n = @import("../i18n/i18n.zig");
 
 const exporting = minilab.@"export";
 const icc = minilab.codecs.icc;
@@ -39,10 +40,8 @@ const grid_gap = 10;
 /// A Metadata row, tall enough for a text field, and the gap between rows.
 const detail_row = 28;
 const metadata_gap = 6;
-/// The longest a detail or a field's value can be, in bytes, and a field's name. A detail holds
-/// more than New roll's notes box, so notes typed there fit. A longer one, say from a roll.json
-/// edited by hand, is shown cut short and can't be edited here (`showCut`).
-const detail_capacity = 1024;
+/// The longest a field's value can be, in bytes, as long as a detail, and a field's name.
+const detail_capacity = roll_details.capacity;
 const field_name_capacity = 64;
 const metadata_check = 13;
 /// A Metadata row's columns: the check box, its name and the gaps between them.
@@ -127,27 +126,42 @@ const SizeChoice = enum {
     /// Takes its long edge from `State.custom_edge`.
     custom,
 
+    /// The long edge of a size that sets one, in pixels.
+    fn fixedEdge(choice: SizeChoice) ?usize {
+        return switch (choice) {
+            .long_edge_4000 => 4000,
+            .long_edge_2048 => 2048,
+            .full, .custom => null,
+        };
+    }
+
     fn label(choice: SizeChoice) []const u8 {
         return switch (choice) {
-            .full => "Full resolution",
-            .long_edge_4000 => "Long edge 4000 px",
-            .long_edge_2048 => "Long edge 2048 px",
-            .custom => "Custom long edge",
+            .full => i18n.t.@"export".full_resolution,
+            .long_edge_4000, .long_edge_2048 => gui.say(i18n.t.@"export".long_edge_of, .{choice.fixedEdge().?}),
+            .custom => i18n.t.@"export".custom_long_edge,
         };
     }
 };
-/// The range a custom long edge can take, in pixels.
+/// The range a custom long edge can take, in pixels, and the one it starts at.
 const min_custom_edge = 64;
 const max_custom_edge = 65535;
+const default_custom_edge = "3000";
 /// The star filter's choices: any rating, then at least 1 to 5 stars.
-const star_filters = [_][]const u8{ "Any rating", "1+ stars", "2+ stars", "3+ stars", "4+ stars", "5 stars" };
+fn starFilters() [roll.Rating.max_stars + 1][]const u8 {
+    var names: [roll.Rating.max_stars + 1][]const u8 = undefined;
+    names[0] = i18n.t.@"export".any_rating;
+    for (names[1..], 1..) |*name, stars| {
+        name.* = gui.say(if (stars == roll.Rating.max_stars) i18n.t.@"export".stars_exactly else i18n.t.@"export".stars_or_more, .{stars});
+    }
+    return names;
+}
 const star_filter_width = 120;
 const default_pattern = "{roll}_{frame:02}";
 
 /// A field you can type in on Metadata: one of the roll's details, or the name or value of one of
 /// its own fields.
 const Editing = union(enum) {
-    detail: roll.Detail,
     field_name: usize,
     field_value: usize,
 };
@@ -193,14 +207,13 @@ pub const State = struct {
     space: icc.Space = .display_p3,
     size: SizeChoice = .full,
     /// The long edge for Custom, in pixels, as typed.
-    custom_edge: [8:0]u8 = gui.initText(8, "3000"),
+    custom_edge: [8:0]u8 = gui.initText(8, default_custom_edge),
     pattern: [gui.text_capacity:0]u8 = gui.initText(gui.text_capacity, default_pattern),
     /// Where the files go: a path relative to the library's folder, or an absolute one.
     folder: [path_field:0]u8 = @splat(0),
     include: exporting.Include = .{},
-    /// What's in each detail's field. It follows the roll, except while you're typing in it.
-    details: std.EnumArray(roll.Detail, [detail_capacity:0]u8) = .initFill(@splat(0)),
-    saved: saved_details.State = .{},
+    /// The boxes for the roll's details.
+    details: roll_details.Boxes = .{},
     /// The boxes for the roll's own fields, filled from the roll.
     custom: std.ArrayList(FieldBoxes) = .empty,
     /// The field being typed in, if any.
@@ -242,9 +255,7 @@ pub const State = struct {
             .quality = @intFromFloat(std.math.clamp(@round(state.quality), 1, 100)),
             .space = state.space,
             .long_edge = switch (state.size) {
-                .full => null,
-                .long_edge_4000 => 4000,
-                .long_edge_2048 => 2048,
+                .full, .long_edge_4000, .long_edge_2048 => state.size.fixedEdge(),
                 .custom => state.customEdge(),
             },
         };
@@ -301,7 +312,7 @@ pub const State = struct {
             state.last = null;
             state.setFolder(defaultFolder(library, r));
             // The boxes held the last roll's details.
-            state.details = .initFill(@splat(0));
+            state.details = .{};
             state.custom.clearRetainingCapacity();
             state.editing = null;
         }
@@ -330,17 +341,19 @@ pub const State = struct {
             running.future.await(ctx.io);
             state.last = summarise(running);
             const batch = running.batch;
-            if (batch.failure) |failure| {
+            const written = batch.written.load(.acquire);
+            const total = batch.jobs.len;
+            const messages = &i18n.t.@"export";
+            const notice = if (batch.failure) |failure|
                 if (failure.number == 0)
-                    ctx.notice.set("Export failed · can't create folder ({t})", .{failure.err})
+                    gui.say(messages.export_folder_failed, .{@errorName(failure.err)})
                 else
-                    ctx.notice.set("Exported {d} of {d} files · frame {d} failed ({t})", .{ batch.written.load(.acquire), batch.jobs.len, failure.number, failure.err });
-            } else if (batch.written.load(.acquire) < batch.jobs.len) {
-                ctx.notice.set("Export canceled · {d} of {d} files", .{ batch.written.load(.acquire), batch.jobs.len });
-            } else {
-                const written = batch.written.load(.acquire);
-                ctx.notice.set("Exported {d} {s} to {s}", .{ written, if (written == 1) "file" else "files", relativeToLibrary(ctx.library.path, batch.folder) });
-            }
+                    gui.say(messages.export_frame_failed, .{ written, total, failure.number, @errorName(failure.err) })
+            else if (written < total)
+                gui.say(messages.export_canceled, .{ written, total })
+            else
+                gui.say(if (written == 1) messages.exported_one else messages.exported_many, .{ written, relativeToLibrary(ctx.library.path, batch.folder) });
+            ctx.notice.set("{s}", .{notice});
             batch.destroy(ctx.gpa);
             state.running = null;
         };
@@ -374,15 +387,17 @@ fn summarise(running: *const Running) Summary {
     var summary: Summary = .{};
     const written = batch.written.load(.acquire);
     const total = batch.jobs.len;
+    const messages = &i18n.t.@"export";
+    const what = running.what.text();
     if (batch.failure) |failure| {
         if (failure.number == 0)
-            summary.line.set("Export failed · can't create folder ({t})", .{failure.err})
+            summary.line.set("{s}", .{gui.say(messages.export_folder_failed, .{@errorName(failure.err)})})
         else
-            summary.line.set("Last export · {d} of {d} files · {s} · frame {d} failed ({t})", .{ written, total, running.what.text(), failure.number, failure.err });
+            summary.line.set("{s}", .{gui.say(messages.last_export_failed, .{ written, total, what, failure.number, @errorName(failure.err) })});
     } else if (written < total) {
-        summary.line.set("Export canceled · {d} of {d} files · {s}", .{ written, total, running.what.text() });
+        summary.line.set("{s} · {s}", .{ gui.say(messages.export_canceled, .{ written, total }), what });
     } else {
-        summary.line.set("Last export · {d} {s} · {s}", .{ written, if (written == 1) "file" else "files", running.what.text() });
+        summary.line.set("{s}", .{gui.say(if (written == 1) messages.last_export_one else messages.last_export_many, .{ written, what })});
     }
     const shown = std.fs.path.basename(batch.folder);
     const extension = batch.options.format.extension();
@@ -412,7 +427,7 @@ pub fn draw(state: *State, ctx: context.Context) ?context.Workspace {
     const available = c.ImGui_GetContentRegionAvail();
     const panel = gui.px(settings_width);
 
-    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_ChildBg, theme.page);
+    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_ChildBg, theme.colors.page);
     c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_WindowPadding, gui.vec2(0, 0));
     _ = c.ImGui_BeginChild("frames", gui.vec2(available.x - panel, available.y), c.ImGuiChildFlags_None, c.ImGuiWindowFlags_NoScrollbar | c.ImGuiWindowFlags_NoScrollWithMouse);
     drawPage(state, ctx, roll_index);
@@ -424,9 +439,8 @@ pub fn draw(state: *State, ctx: context.Context) ?context.Workspace {
     c.ImGui_PopStyleVar();
     const window = c.ImGui_GetWindowPos();
     drawSettings(state, ctx, roll_index);
-    c.ImDrawList_AddLine(c.ImGui_GetWindowDrawList(), window, gui.vec2(window.x, window.y + available.y), theme.imU32(theme.divider));
+    c.ImDrawList_AddLineV(c.ImGui_GetWindowDrawList(), window.x, window.y, window.y + available.y, theme.imU32(theme.colors.divider));
     c.ImGui_EndChild();
-    saved_details.manager(&state.saved, &ctx.library.saved_details, ctx.io);
     return null;
 }
 
@@ -436,11 +450,11 @@ fn drawNoRoll() ?context.Workspace {
     const list = c.ImGui_GetWindowDrawList();
     var at = gui.vec2(origin.x + gui.px(page_padding_x), origin.y + gui.px(page_padding_y));
     fonts.pushSized(.semibold, fonts.page_title_size);
-    c.ImDrawList_AddText(list, at, theme.imU32(theme.text), "Export");
+    c.ImDrawList_AddText(list, at, theme.imU32(theme.colors.text), i18n.t.@"export".title);
     fonts.pop();
     at.y += gui.lineFor(fonts.page_title_size) + gui.px(block_gap);
     const go = gui.noRoll(at);
-    shortcuts.tooltip("Rolls", .rolls);
+    shortcuts.tooltip(i18n.t.rolls.title, .rolls);
     return if (go) .rolls else null;
 }
 
@@ -461,7 +475,7 @@ fn drawPage(state: *State, ctx: context.Context, roll_index: usize) void {
     const grid_top = top + gui.px(control_height + block_gap);
     const grid_bottom = bottom - section_height - gui.px(block_gap);
     c.ImGui_SetCursorScreenPos(gui.vec2(left, grid_top));
-    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_ChildBg, theme.withAlpha(theme.page, 0));
+    c.ImGui_PushStyleColorImVec4(c.ImGuiCol_ChildBg, theme.withAlpha(theme.colors.page, 0));
     _ = c.ImGui_BeginChild("grid", gui.vec2(right - left, @max(grid_bottom - grid_top, gui.px(grid_min_height))), c.ImGuiChildFlags_None, c.ImGuiWindowFlags_None);
     drawGrid(state, ctx, roll_index);
     c.ImGui_EndChild();
@@ -477,30 +491,34 @@ fn drawTitleRow(state: *State, r: *const roll.Roll, left: f32, right: f32, top: 
     const height = gui.px(control_height);
 
     fonts.pushSized(.semibold, fonts.page_title_size);
-    const title = gui.print("Export {s}", .{r.info.name});
+    const title = gui.say(i18n.t.@"export".title_roll, .{r.info.name});
     const title_width = c.ImGui_CalcTextSize(title).x;
-    c.ImDrawList_AddText(list, gui.vec2(left, top + (height - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.text), title);
+    c.ImDrawList_AddText(list, gui.vec2(left, top + (height - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.colors.text), title);
     fonts.pop();
-    const count = gui.print("{d} of {d} frames selected", .{ state.selectedCount(), r.frames.items.len });
-    c.ImDrawList_AddText(list, gui.vec2(left + title_width + gui.px(toolbar_gap), top + (height - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.text_tertiary), count);
+    const count = gui.say(i18n.t.@"export".selected, .{ state.selectedCount(), r.frames.items.len });
+    c.ImDrawList_AddText(list, gui.vec2(left + title_width + gui.px(toolbar_gap), top + (height - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.colors.text_tertiary), count);
 
-    const none_width = gui.fittedWidth("Select none", gui.button_padding);
-    const all_width = gui.fittedWidth("Select all", gui.button_padding);
+    const select_all = i18n.t.common.select_all;
+    const select_none = i18n.t.common.select_none;
+    const none_width = gui.fittedWidth(select_none, gui.button_padding);
+    const all_width = gui.fittedWidth(select_all, gui.button_padding);
     const all_x = right - none_width - gui.px(toolbar_gap) - all_width;
-    c.ImGui_SetCursorScreenPos(gui.vec2(all_x - gui.px(toolbar_gap + star_filter_width), top));
+    c.ImGui_SetCursorScreenPos(gui.vec2(all_x - gui.px(toolbar_gap + star_filter_width + gui.filter_icon_space), top));
+    gui.filterIcon(height);
     c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_FramePadding, gui.vec2(gui.px(combo_padding), (height - c.ImGui_GetFontSize()) / 2));
+    const star_filters = starFilters();
     if (gui.combo("stars", &star_filters, state.min_stars, star_filter_width)) |picked| {
         state.min_stars = picked;
         state.applyFilter(r);
     }
     c.ImGui_PopStyleVar();
-    gui.tooltip("Rejected left out");
+    gui.tooltip(i18n.t.@"export".filter_tooltip);
     c.ImGui_SetCursorScreenPos(gui.vec2(all_x, top));
-    if (gui.buttonOf(.normal, "Select all", gui.vec2(all_width / gui.scale, control_height))) state.selectAll(true);
-    shortcuts.tooltip("Select all", .select_all);
+    if (gui.buttonOf(.normal, select_all, gui.vec2(all_width / gui.scale, control_height))) state.selectAll(true);
+    shortcuts.tooltip(select_all, .select_all);
     c.ImGui_SetCursorScreenPos(gui.vec2(right - none_width, top));
-    if (gui.buttonOf(.secondary, "Select none", gui.vec2(none_width / gui.scale, height / gui.scale))) state.selectAll(false);
-    shortcuts.tooltip("Select none", .select_none);
+    if (gui.buttonOf(.secondary, select_none, gui.vec2(none_width / gui.scale, control_height))) state.selectAll(false);
+    shortcuts.tooltip(select_none, .select_none);
 }
 
 /// Draws the frames as cards, in as many columns of at least 150 pixels as fit. A click picks or
@@ -511,7 +529,7 @@ fn drawGrid(state: *State, ctx: context.Context, roll_index: usize) void {
     const list = c.ImGui_GetWindowDrawList();
     const origin = c.ImGui_GetCursorScreenPos();
     if (total == 0) {
-        c.ImDrawList_AddText(list, origin, theme.imU32(theme.text_tertiary), "No frames yet");
+        c.ImDrawList_AddText(list, origin, theme.imU32(theme.colors.text_tertiary), i18n.t.common.no_frames_yet);
         return;
     }
     const width = c.ImGui_GetContentRegionAvail().x;
@@ -535,7 +553,7 @@ fn drawGrid(state: *State, ctx: context.Context, roll_index: usize) void {
         const hovered = c.ImGui_IsItemHovered(0);
         const frame = r.frames.items[i];
         if (hovered) {
-            gui.showTooltip(gui.print("Frame {d} · {s}", .{ i + 1, if (!frame.developed) "not developed · automatic settings" else frame.look.label() }));
+            gui.showTooltip(gui.say(i18n.t.@"export".frame_tooltip, .{ i + 1, if (!frame.developed) i18n.t.@"export".not_developed else labels.look(&frame.look) }));
         }
         if (clicked) {
             if (shift and state.anchor != null) {
@@ -549,14 +567,14 @@ fn drawGrid(state: *State, ctx: context.Context, roll_index: usize) void {
 
         // The card.
         const radius = gui.px(gui.control_rounding);
-        if (on) c.ImDrawList_AddRectFilledEx(list, corner, far, theme.imU32(theme.control), radius, 0);
-        c.ImDrawList_AddRectEx(list, corner, far, theme.imU32(if (on) theme.accent else if (hovered) theme.border else theme.divider), radius, 1, 0);
+        if (on) c.ImDrawList_AddRectFilledEx(list, corner, far, theme.imU32(theme.colors.control), radius, 0);
+        c.ImDrawList_AddRectEx(list, corner, far, theme.imU32(if (on) theme.colors.accent else if (hovered) theme.colors.border else theme.colors.divider), radius, 1, 0);
         const picture_min = gui.vec2(corner.x + inset, corner.y + inset);
         const picture_max = gui.vec2(far.x - inset, picture_min.y + picture_height);
         if (ctx.library.thumbnail(ctx.gpa, .{ .roll = roll_index, .frame = i })) |t| {
             gui.imageCover(list, t.ref(), t.width, t.height, picture_min, picture_max, gui.px(picture_rounding));
         } else {
-            c.ImDrawList_AddRectFilledEx(list, picture_min, picture_max, theme.imU32(theme.control_hover), gui.px(picture_rounding), 0);
+            c.ImDrawList_AddRectFilledEx(list, picture_min, picture_max, theme.imU32(theme.colors.control_hover), gui.px(picture_rounding), 0);
         }
 
         // The number and the check box under the picture.
@@ -564,22 +582,22 @@ fn drawGrid(state: *State, ctx: context.Context, roll_index: usize) void {
         fonts.pushSized(.mono, fonts.small_size);
         const number = labels.frameNumber(i);
         const number_end = picture_min.x + gui.px(card_inset) + c.ImGui_CalcTextSize(number).x;
-        c.ImDrawList_AddText(list, gui.vec2(picture_min.x + gui.px(card_inset), label_top + (gui.px(small_line) - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.text_secondary), number);
+        c.ImDrawList_AddText(list, gui.vec2(picture_min.x + gui.px(card_inset), label_top + (gui.px(small_line) - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.colors.text_secondary), number);
         fonts.pop();
         // The frame's stars, or that it's rejected.
         const label_middle = label_top + gui.px(small_line) / 2;
         if (frame.rating.rejected) {
-            c.ImDrawList_AddText(list, gui.vec2(number_end + gui.px(rating_gap), label_middle - c.ImGui_GetFontSize() / 2), theme.imU32(theme.red), "Rejected");
+            c.ImDrawList_AddText(list, gui.vec2(number_end + gui.px(rating_gap), label_middle - c.ImGui_GetFontSize() / 2), theme.imU32(theme.red), i18n.t.@"export".rejected);
         } else for (0..frame.rating.stars) |k| {
             const star = gui.px(star_radius);
-            gui.star(list, gui.vec2(number_end + gui.px(rating_gap) + star + @as(f32, @floatFromInt(k)) * (2 * star + gui.px(star_gap)), label_middle), star, true, theme.accent);
+            gui.star(list, gui.vec2(number_end + gui.px(rating_gap) + star + @as(f32, @floatFromInt(k)) * (2 * star + gui.px(star_gap)), label_middle), star, true, theme.colors.accent);
         }
         const box_min = gui.vec2(picture_max.x - gui.px(card_inset + check_size), label_top + (gui.px(small_line) - gui.px(check_size)) / 2);
         drawCheck(list, box_min, gui.px(check_size), on);
 
         // Frames left out are dimmed by drawing the page colour over them, standing in for the
         // design's opacity.
-        if (!on) c.ImDrawList_AddRectFilledEx(list, corner, far, theme.imU32(theme.withAlpha(theme.page, 0.45)), radius, 0);
+        if (!on) c.ImDrawList_AddRectFilledEx(list, corner, far, theme.imU32(theme.withAlpha(theme.colors.page, 0.45)), radius, 0);
     }
     const rows = (total + columns - 1) / columns;
     c.ImGui_SetCursorScreenPos(gui.vec2(origin.x, origin.y + @as(f32, @floatFromInt(rows)) * (cell_height + gap) - gap));
@@ -590,14 +608,14 @@ fn drawGrid(state: *State, ctx: context.Context, roll_index: usize) void {
 /// outline when not.
 fn drawCheck(list: *c.ImDrawList, min: gui.Vec2, size: f32, on: bool) void {
     if (on) return gui.tickedBox(list, min, size);
-    c.ImDrawList_AddRectEx(list, min, gui.vec2(min.x + size, min.y + size), theme.imU32(theme.track), gui.px(gui.box_rounding), 1, 0);
+    c.ImDrawList_AddRectEx(list, min, gui.vec2(min.x + size, min.y + size), theme.imU32(theme.colors.track), gui.px(gui.box_rounding), 1, 0);
 }
 
 /// Draws the bottom of the page: the running export with its progress and Cancel, or what the
 /// last one wrote, with Show in folder.
 fn drawSection(state: *State, min: gui.Vec2, max: gui.Vec2) void {
     const list = c.ImGui_GetWindowDrawList();
-    c.ImDrawList_AddRectFilledEx(list, min, max, theme.imU32(theme.panel), gui.px(section_rounding), 0);
+    c.ImDrawList_AddRectFilledEx(list, min, max, theme.imU32(theme.colors.panel), gui.px(section_rounding), 0);
     const x = min.x + gui.px(section_padding);
     const right = max.x - gui.px(section_padding);
     const first_top = min.y + gui.px(section_padding);
@@ -610,14 +628,14 @@ fn drawSection(state: *State, min: gui.Vec2, max: gui.Vec2) void {
         const job = batch.jobs[current];
         const cancelling = batch.cancel.load(.acquire);
         const status = if (cancelling)
-            gui.print("Canceling after frame {d}…", .{job.number})
+            gui.say(i18n.t.@"export".canceling, .{job.number})
         else
-            gui.print("Exporting {d} of {d} · {s}.{s} · {s}", .{ current + 1, batch.jobs.len, job.stem, batch.options.format.extension(), batch.stage.load(.acquire).label() });
+            gui.say(i18n.t.@"export".exporting_file, .{ current + 1, batch.jobs.len, gui.print("{s}.{s}", .{ job.stem, batch.options.format.extension() }), labels.exportStage(batch.stage.load(.acquire)) });
         if (!cancelling) {
-            if (link(gui.vec2(right, first_top), "Cancel")) batch.cancel.store(true, .release);
-            shortcuts.tooltip("Cancel", .cancel);
+            if (link(gui.vec2(right, first_top), i18n.t.common.cancel)) batch.cancel.store(true, .release);
+            shortcuts.tooltip(i18n.t.common.cancel, .cancel);
         }
-        c.ImDrawList_AddText(list, gui.vec2(x, first_y), theme.imU32(theme.text), gui.elideEnd(status, right - x - gui.px(progress_room)));
+        c.ImDrawList_AddText(list, gui.vec2(x, first_y), theme.imU32(theme.colors.text), gui.elideEnd(status, right - x - gui.px(progress_room)));
         // The progress bar, on the second line.
         const bar_y = second_top + (gui.px(small_line) - gui.px(progress_height)) / 2;
         gui.progressBar(list, gui.vec2(x, bar_y), gui.vec2(right, bar_y + gui.px(progress_height)), batch.progress());
@@ -625,16 +643,16 @@ fn drawSection(state: *State, min: gui.Vec2, max: gui.Vec2) void {
     }
 
     const summary = if (state.last) |*s| s else {
-        c.ImDrawList_AddText(list, gui.vec2(x, first_y), theme.imU32(theme.text_secondary), "Nothing exported yet");
+        c.ImDrawList_AddText(list, gui.vec2(x, first_y), theme.imU32(theme.colors.text_secondary), i18n.t.@"export".nothing_exported);
         fonts.pushSized(.mono, fonts.small_size);
-        c.ImDrawList_AddText(list, gui.vec2(x, second_top + (gui.px(small_line) - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.text_tertiary), gui.elideStart(std.mem.sliceTo(&state.folder, 0), right - x));
+        c.ImDrawList_AddText(list, gui.vec2(x, second_top + (gui.px(small_line) - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.colors.text_tertiary), gui.elideStart(std.mem.sliceTo(&state.folder, 0), right - x));
         fonts.pop();
         return;
     };
-    if (link(gui.vec2(right, first_top), "Show in folder")) showFolder(summary.folder.text());
-    c.ImDrawList_AddText(list, gui.vec2(x, first_y), theme.imU32(theme.text), gui.elideEnd(summary.line.text(), right - x - gui.px(summary_room)));
+    if (link(gui.vec2(right, first_top), i18n.t.@"export".show_in_folder)) showFolder(summary.folder.text());
+    c.ImDrawList_AddText(list, gui.vec2(x, first_y), theme.imU32(theme.colors.text), gui.elideEnd(summary.line.text(), right - x - gui.px(summary_room)));
     fonts.pushSized(.mono, fonts.small_size);
-    c.ImDrawList_AddText(list, gui.vec2(x, second_top + (gui.px(small_line) - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.text_tertiary), gui.elideStart(summary.files.text(), right - x));
+    c.ImDrawList_AddText(list, gui.vec2(x, second_top + (gui.px(small_line) - c.ImGui_GetFontSize()) / 2), theme.imU32(theme.colors.text_tertiary), gui.elideStart(summary.files.text(), right - x));
     fonts.pop();
 }
 
@@ -648,11 +666,11 @@ fn link(top_right: gui.Vec2, label: [:0]const u8) bool {
     const hovered = c.ImGui_IsItemHovered(0);
     if (hovered) c.ImGui_SetMouseCursor(c.ImGuiMouseCursor_Hand);
     const list = c.ImGui_GetWindowDrawList();
-    const ink = theme.imU32(if (hovered) theme.text else theme.text_secondary);
+    const ink = theme.imU32(if (hovered) theme.colors.text else theme.colors.text_secondary);
     const y = corner.y + (gui.px(line) - size.y) / 2;
     c.ImDrawList_AddText(list, gui.vec2(corner.x, y), ink, label);
     const underline = y + size.y + gui.px(link_underline);
-    c.ImDrawList_AddLine(list, gui.vec2(corner.x, underline), gui.vec2(corner.x + size.x, underline), ink);
+    c.ImDrawList_AddLineH(list, corner.x, corner.x + size.x, underline, ink);
     return clicked;
 }
 
@@ -687,11 +705,11 @@ fn drawSettings(state: *State, ctx: context.Context, roll_index: usize) void {
     const running = state.running != null;
 
     // FILE.
-    _ = gui.headingAt(list, x, y, "FILE");
+    _ = gui.headingAt(list, x, y, i18n.t.@"export".file_heading);
     y += gui.px(small_line + block_gap);
     y = drawFileChoices(state, x, y, width);
     y += gui.px(block_gap);
-    y += gui.paragraphAt(list, x, y, width, theme.text_tertiary, formatNote(state));
+    y += gui.paragraphAt(list, x, y, width, theme.colors.text_tertiary, formatNote(state));
     y += gui.px(block_gap);
 
     c.ImGui_BeginDisabled(running);
@@ -700,11 +718,11 @@ fn drawSettings(state: *State, ctx: context.Context, roll_index: usize) void {
 
     // METADATA.
     y += gui.px(block_gap + 6);
-    _ = gui.headingAt(list, x, y, "METADATA");
+    _ = gui.headingAt(list, x, y, i18n.t.@"export".metadata_heading);
     y += gui.px(small_line + block_gap);
     y = drawMetadata(state, ctx, roll_index, x, y, width);
     y += gui.px(block_gap);
-    y += gui.paragraphAt(list, x, y, width, theme.text_tertiary, "EXIF and XMP in each file");
+    y += gui.paragraphAt(list, x, y, width, theme.colors.text_tertiary, i18n.t.@"export".metadata_note);
 
     // Export, at the bottom.
     const button_y = @max(y + gui.px(block_gap), origin.y + height - gui.px(panel_padding + export_height));
@@ -712,12 +730,13 @@ fn drawSettings(state: *State, ctx: context.Context, roll_index: usize) void {
     const count = state.selectedCount();
     const pattern_ok = if (exporting.checkPattern(std.mem.sliceTo(&state.pattern, 0))) true else |_| false;
     const folder_ok = std.mem.sliceTo(&state.folder, 0).len > 0;
-    const label = if (running) "Exporting…" else if (count == 1) "Export 1 frame" else gui.print("Export {d} frames", .{count});
+    const label = if (running) i18n.t.@"export".exporting else if (count == 1) i18n.t.@"export".export_one else gui.say(i18n.t.@"export".export_many, .{count});
     c.ImGui_BeginDisabled(running or count == 0 or !pattern_ok or !folder_ok or state.file == .heic);
     if (gui.buttonOf(.primary, gui.print("{s}##export", .{label}), gui.vec2(width / gui.scale, export_height))) start(state, ctx, r);
     c.ImGui_EndDisabled();
     if (c.ImGui_IsItemHovered(c.ImGuiHoveredFlags_AllowWhenDisabled)) {
-        const why: ?[]const u8 = if (running) "Export under way" else if (count == 0) "No frames selected" else if (!pattern_ok) "Invalid file name pattern" else if (!folder_ok) "No folder chosen" else null;
+        const messages = &i18n.t.@"export";
+        const why: ?[]const u8 = if (running) messages.under_way else if (count == 0) messages.no_frames_selected else if (!pattern_ok) messages.invalid_pattern else if (!folder_ok) messages.no_folder else null;
         if (why) |text| gui.showTooltip(text);
     }
     c.ImGui_SetCursorScreenPos(gui.vec2(x, button_y + gui.px(export_height + panel_padding)));
@@ -740,7 +759,7 @@ fn drawFileChoices(state: *State, x: f32, top: f32, width: f32) f32 {
         c.ImGui_SetCursorScreenPos(at);
         if (choice == .heic) {
             drawUnavailable(label, gui.vec2(pill_width, height));
-            if (c.ImGui_IsItemHovered(c.ImGuiHoveredFlags_AllowWhenDisabled)) gui.showTooltip("Not available yet");
+            if (c.ImGui_IsItemHovered(c.ImGuiHoveredFlags_AllowWhenDisabled)) gui.showTooltip(i18n.t.@"export".not_available);
         } else {
             if (gui.buttonOf(if (state.file == choice) .selected else .unselected, label, gui.vec2(pill_width / gui.scale, pill_height))) state.file = choice;
         }
@@ -755,21 +774,21 @@ fn drawUnavailable(label: [:0]const u8, size: gui.Vec2) void {
     _ = c.ImGui_InvisibleButton(label, size, 0);
     const list = c.ImGui_GetWindowDrawList();
     const far = gui.vec2(corner.x + size.x, corner.y + size.y);
-    gui.dashedRoundedRect(list, corner, far, theme.imU32(theme.border), gui.px(gui.choice_rounding));
+    gui.dashedRoundedRect(list, corner, far, theme.imU32(theme.colors.border), gui.px(gui.choice_rounding));
     const text_size = c.ImGui_CalcTextSize(label);
-    c.ImDrawList_AddText(list, gui.vec2(corner.x + (size.x - text_size.x) / 2, corner.y + (size.y - text_size.y) / 2), theme.imU32(theme.text_tertiary), label);
+    c.ImDrawList_AddText(list, gui.vec2(corner.x + (size.x - text_size.x) / 2, corner.y + (size.y - text_size.y) / 2), theme.imU32(theme.colors.text_tertiary), label);
 }
 
 /// A note on the chosen file type, and anything worth knowing about it for these frames.
 fn formatNote(state: *const State) []const u8 {
     const options = state.options();
     const base = switch (state.file) {
-        .tiff16 => "16-bit · ZIP · ICC profile",
-        .jpeg => gui.print("8-bit · quality {d} · ICC profile", .{options.quality}),
-        .heic => "HDR with gain map · not available yet",
+        .tiff16 => i18n.t.@"export".tiff_note,
+        .jpeg => gui.say(i18n.t.@"export".jpeg_note, .{options.quality}),
+        .heic => i18n.t.@"export".heic_note,
     };
-    const banding = if (options.space == .prophoto and options.bits() == .eight) " · banding risk in 8-bit" else "";
-    return gui.print("{s}{s}", .{ base, banding });
+    if (options.space == .prophoto and options.bits() == .eight) return gui.print("{s} · {s}", .{ base, i18n.t.@"export".banding_risk });
+    return base;
 }
 
 /// Draws colour space, size, file names and folder as the design's grid of rows: a label column,
@@ -789,13 +808,13 @@ fn drawFileGrid(state: *State, ctx: context.Context, x: f32, top: f32, width: f3
     var y = top;
     if (state.file == .jpeg) y = qualityRow(state, grid, y);
 
-    rowLabel(list, x, y, "Color space");
+    rowLabel(list, x, y, i18n.t.@"export".color_space);
     c.ImGui_SetCursorScreenPos(gui.vec2(control_x, y));
     c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_FramePadding, gui.vec2(gui.px(combo_padding), (row - c.ImGui_GetFontSize()) / 2));
     if (gui.comboOf(icc.Space, "space", &exporting.spaces, state.space, spaceLabel, control_width / gui.scale)) |picked| state.space = picked;
     y += row + gui.px(grid_gap);
 
-    rowLabel(list, x, y, "Size");
+    rowLabel(list, x, y, i18n.t.@"export".size);
     c.ImGui_SetCursorScreenPos(gui.vec2(control_x, y));
     if (gui.comboOf(SizeChoice, "size", std.enums.values(SizeChoice), state.size, SizeChoice.label, control_width / gui.scale)) |picked| state.size = picked;
     c.ImGui_PopStyleVar();
@@ -823,10 +842,10 @@ fn qualityRow(state: *State, grid: FileGrid, top: f32) f32 {
     const control_width = grid.control_width;
     const row = grid.row;
     var y = top;
-    rowLabel(list, x, y, "Quality");
+    rowLabel(list, x, y, i18n.t.@"export".quality);
     c.ImGui_SetCursorScreenPos(gui.vec2(control_x, y + (row - c.ImGui_GetFrameHeight()) / 2));
     _ = gui.slider("quality", &state.quality, 1, 100, control_width / gui.scale - gui.value_column - gui.label_gap - gui.reset_space);
-    gui.tooltip("Higher is sharper and larger · 90 and up keep full color");
+    gui.tooltip(i18n.t.@"export".quality_tooltip);
     state.quality = @round(state.quality);
     const shown = gui.print("{d:.0}", .{state.quality});
     gui.valueText(shown);
@@ -845,17 +864,17 @@ fn longEdgeRow(state: *State, grid: FileGrid, top: f32) f32 {
     const control_x = grid.control_x;
     const row = grid.row;
     var y = top;
-    rowLabel(list, x, y, "Long edge");
+    rowLabel(list, x, y, i18n.t.@"export".long_edge);
     c.ImGui_SetCursorScreenPos(gui.vec2(control_x, y));
     fonts.pushSized(.mono, fonts.small_size);
     c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_FramePadding, gui.vec2(gui.px(field_padding), (row - c.ImGui_GetFontSize()) / 2));
     c.ImGui_SetNextItemWidth(gui.px(edge_field_width));
-    _ = c.ImGui_InputTextWithHint("##long edge", "3000", &state.custom_edge, state.custom_edge.len + 1, c.ImGuiInputTextFlags_CharsDecimal);
+    _ = c.ImGui_InputTextWithHint("##long edge", default_custom_edge, &state.custom_edge, state.custom_edge.len + 1, c.ImGuiInputTextFlags_CharsDecimal);
     c.ImGui_PopStyleVar();
     fonts.pop();
-    if (c.ImGui_IsItemHovered(c.ImGuiHoveredFlags_AllowWhenDisabled)) gui.showTooltip(gui.print("{d} to {d} px", .{ min_custom_edge, max_custom_edge }));
+    if (c.ImGui_IsItemHovered(c.ImGuiHoveredFlags_AllowWhenDisabled)) gui.showTooltip(gui.say(i18n.t.@"export".long_edge_range, .{ min_custom_edge, max_custom_edge }));
     const unit_y = y + (row - c.ImGui_GetFontSize()) / 2;
-    c.ImDrawList_AddText(list, gui.vec2(control_x + gui.px(edge_field_width + unit_gap), unit_y), theme.imU32(theme.text_tertiary), "px");
+    c.ImDrawList_AddText(list, gui.vec2(control_x + gui.px(edge_field_width + unit_gap), unit_y), theme.imU32(theme.colors.text_tertiary), "px");
     y += row + gui.px(grid_gap);
     return y;
 }
@@ -868,7 +887,7 @@ fn namesRow(state: *State, grid: FileGrid, top: f32) f32 {
     const control_width = grid.control_width;
     const row = grid.row;
     var y = top;
-    rowLabel(list, x, y, "File names");
+    rowLabel(list, x, y, i18n.t.@"export".file_names);
     c.ImGui_SetCursorScreenPos(gui.vec2(control_x, y));
     fonts.pushSized(.mono, fonts.small_size);
     c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_FramePadding, gui.vec2(gui.px(field_padding), (row - c.ImGui_GetFontSize()) / 2));
@@ -876,17 +895,18 @@ fn namesRow(state: *State, grid: FileGrid, top: f32) f32 {
     c.ImGui_PopStyleVar();
     fonts.pop();
     if (c.ImGui_IsItemHovered(c.ImGuiHoveredFlags_AllowWhenDisabled)) {
-        gui.showTooltip("{roll}  roll name, lowercase\n{name}  roll name\n{frame}  frame number\n{frame:02}  two digits\n{stock}  film stock\n{date}  date shot");
+        const messages = &i18n.t.@"export";
+        gui.showTooltip(gui.print("{{roll}}  {s}\n{{name}}  {s}\n{{frame}}  {s}\n{{frame:02}}  {s}\n{{stock}}  {s}\n{{date}}  {s}", .{ messages.pattern_roll, messages.pattern_name, messages.pattern_frame, messages.pattern_frame_digits, messages.pattern_stock, messages.pattern_date }));
     }
     y += row;
     if (exporting.checkPattern(std.mem.sliceTo(&state.pattern, 0))) |_| {} else |err| {
         y += gui.px(problem_gap);
         const problem = switch (err) {
-            error.NoFrameNumber => "{frame} missing",
-            error.UnknownField => "Unknown field",
-            error.UnclosedBrace => "Unclosed brace",
+            error.NoFrameNumber => i18n.t.@"export".frame_missing,
+            error.UnknownField => i18n.t.@"export".unknown_field,
+            error.UnclosedBrace => i18n.t.@"export".unclosed_brace,
         };
-        y += gui.paragraphAt(list, control_x, y, control_width, theme.accent, problem);
+        y += gui.paragraphAt(list, control_x, y, control_width, theme.colors.accent, problem);
         y -= gui.px(line) - c.ImGui_GetFontSize();
     }
     y += gui.px(grid_gap);
@@ -900,23 +920,24 @@ fn folderRow(state: *State, ctx: context.Context, grid: FileGrid, y: f32) f32 {
     const control_x = grid.control_x;
     const control_width = grid.control_width;
     const row = grid.row;
-    rowLabel(list, x, y, "Folder");
-    const choose_width = gui.fittedWidth("Choose", pill_padding);
+    rowLabel(list, x, y, i18n.t.@"export".folder);
+    const choose = i18n.t.common.choose;
+    const choose_width = gui.fittedWidth(choose, pill_padding);
     c.ImGui_SetCursorScreenPos(gui.vec2(control_x, y));
     c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_FramePadding, gui.vec2(gui.px(field_padding), (row - c.ImGui_GetFontSize()) / 2));
     _ = gui.textField("folder", &state.folder, "Roll/exports", (control_width - choose_width - gui.px(field_gap)) / gui.scale);
     c.ImGui_PopStyleVar();
-    if (c.ImGui_IsItemHovered(c.ImGuiHoveredFlags_AllowWhenDisabled)) gui.showTooltip("Relative to the library");
+    if (c.ImGui_IsItemHovered(c.ImGuiHoveredFlags_AllowWhenDisabled)) gui.showTooltip(i18n.t.@"export".folder_tooltip);
     c.ImGui_SetCursorScreenPos(gui.vec2(control_x + control_width - choose_width, y));
     c.ImGui_BeginDisabled(state.dialog.isShowing());
-    if (gui.buttonOf(.normal, "Choose", gui.vec2(choose_width / gui.scale, control_height))) chooseFolder(state, ctx);
+    if (gui.buttonOf(.normal, choose, gui.vec2(choose_width / gui.scale, control_height))) chooseFolder(state, ctx);
     c.ImGui_EndDisabled();
     return y + row;
 }
 
 /// Draws a grid row's label, centred in the row's height.
 fn rowLabel(list: *c.ImDrawList, x: f32, y: f32, label: [:0]const u8) void {
-    gui.textIn(list, x, y, gui.px(control_height), theme.text_secondary, label);
+    gui.textIn(list, x, y, gui.px(control_height), theme.colors.text_secondary, label);
 }
 
 /// Opens the system's folder dialog, starting at the folder that's chosen now.
@@ -941,14 +962,14 @@ fn drawMetadata(state: *State, ctx: context.Context, roll_index: usize, x: f32, 
     var y = top;
 
     const rows = [_]MetadataRow{
-        .{ .label = "Camera", .flag = &state.include.camera, .value = .{ .detail = .camera } },
-        .{ .label = "Lens", .flag = &state.include.lens, .value = .{ .detail = .lens } },
-        .{ .label = "Film stock", .flag = &state.include.stock, .value = .{ .fixed = .{ .text = r.info.stock, .why = "Set in Develop" } } },
-        .{ .label = "Date shot", .flag = &state.include.shot, .value = .{ .detail = .shot } },
-        .{ .label = "Copyright", .flag = &state.include.copyright, .value = .{ .detail = .copyright } },
-        .{ .label = "Notes", .flag = &state.include.notes, .value = .{ .detail = .notes } },
-        .{ .label = "Settings", .flag = &state.include.settings, .value = .{ .fixed = .{ .text = "Look, base, scanner", .quiet = true } } },
-        .{ .label = "Rating", .flag = &state.include.rating, .value = .{ .fixed = .{ .text = "Stars, rejected", .quiet = true } } },
+        .{ .label = roll_details.label(.camera), .flag = &state.include.camera, .value = .{ .detail = .camera } },
+        .{ .label = roll_details.label(.lens), .flag = &state.include.lens, .value = .{ .detail = .lens } },
+        .{ .label = i18n.t.@"export".film_stock, .flag = &state.include.stock, .value = .{ .fixed = .{ .text = r.info.stock, .why = i18n.t.@"export".stock_set_in_develop } } },
+        .{ .label = roll_details.label(.shot), .flag = &state.include.shot, .value = .{ .detail = .shot } },
+        .{ .label = roll_details.label(.copyright), .flag = &state.include.copyright, .value = .{ .detail = .copyright } },
+        .{ .label = roll_details.label(.notes), .flag = &state.include.notes, .value = .{ .detail = .notes } },
+        .{ .label = i18n.t.@"export".settings, .flag = &state.include.settings, .value = .{ .fixed = .{ .text = i18n.t.@"export".settings_note, .quiet = true } } },
+        .{ .label = i18n.t.@"export".rating, .flag = &state.include.rating, .value = .{ .fixed = .{ .text = i18n.t.@"export".rating_note, .quiet = true } } },
     };
     for (rows) |each| {
         metadataCheck(list, x, y, each.label, each.flag);
@@ -967,7 +988,7 @@ fn fixedValue(list: *c.ImDrawList, label: [:0]const u8, fixed: FixedValue, at: g
     const row = gui.px(detail_row);
     const text_y = at.y + (row - c.ImGui_GetFontSize()) / 2;
     const quiet = fixed.quiet or fixed.text == null;
-    c.ImDrawList_AddText(list, gui.vec2(at.x + gui.px(value_inset), text_y), theme.imU32(if (quiet) theme.text_tertiary else theme.text), gui.elideEnd(fixed.text orelse "Not set", width - gui.px(value_inset)));
+    c.ImDrawList_AddText(list, gui.vec2(at.x + gui.px(value_inset), text_y), theme.imU32(if (quiet) theme.colors.text_tertiary else theme.colors.text), gui.elideEnd(fixed.text orelse i18n.t.common.not_set, width - gui.px(value_inset)));
     if (fixed.why) |why| {
         c.ImGui_SetCursorScreenPos(at);
         _ = c.ImGui_InvisibleButton(label, gui.vec2(width, row), 0);
@@ -982,11 +1003,12 @@ fn drawOwnFields(state: *State, ctx: context.Context, r: *roll.Roll, list: *c.Im
     var y = at.y;
     const row = gui.px(detail_row);
     const value_width = x + width - value_x;
-    metadataCheck(list, x, y, "Own fields", &state.include.fields);
-    const add_width = gui.fittedWidth("Add field", pill_padding);
+    metadataCheck(list, x, y, i18n.t.@"export".own_fields, &state.include.fields);
+    const add_label = i18n.t.@"export".add_field;
+    const add_width = gui.fittedWidth(add_label, pill_padding);
     c.ImGui_SetCursorScreenPos(gui.vec2(x + width - add_width, y));
-    const add = gui.buttonOf(.normal, "Add field", gui.vec2(add_width / gui.scale, detail_row));
-    gui.tooltip("Written to XMP");
+    const add = gui.buttonOf(.normal, add_label, gui.vec2(add_width / gui.scale, detail_row));
+    gui.tooltip(i18n.t.@"export".add_field_tooltip);
     y += row + gui.px(metadata_gap);
     syncFields(state, ctx.gpa, r);
     var remove: ?usize = null;
@@ -1004,19 +1026,19 @@ fn drawOwnFields(state: *State, ctx: context.Context, r: *roll.Roll, list: *c.Im
             state.focus_new_field = false;
         }
         c.ImGui_BeginDisabled(!field.fits);
-        _ = gui.textField("name", &field.name, "Name", (name_width - gui.px(metadata_spacing)) / gui.scale);
-        edited = trackEdit(state, .{ .field_name = i }) or edited;
+        _ = gui.textField("name", &field.name, i18n.t.@"export".field_name_hint, (name_width - gui.px(metadata_spacing)) / gui.scale);
+        edited = trackEdit(state, .{ .field_name = i }, .ofLastItem()) or edited;
         c.ImGui_SetCursorScreenPos(gui.vec2(value_left, y));
-        _ = gui.textField("value", &field.value, "Value", (value_width - remove_size - gui.px(metadata_spacing)) / gui.scale);
-        edited = trackEdit(state, .{ .field_value = i }) or edited;
+        _ = gui.textField("value", &field.value, i18n.t.@"export".field_value_hint, (value_width - remove_size - gui.px(metadata_spacing)) / gui.scale);
+        edited = trackEdit(state, .{ .field_value = i }, .ofLastItem()) or edited;
         c.ImGui_EndDisabled();
         c.ImGui_PopStyleVar();
         c.ImGui_SetCursorScreenPos(gui.vec2(x + width - remove_size, y));
         if (c.ImGui_InvisibleButton("remove", gui.vec2(remove_size, remove_size), 0)) remove = i;
         const hovered = c.ImGui_IsItemHovered(0);
-        if (hovered) gui.showTooltip("Remove");
+        if (hovered) gui.showTooltip(i18n.t.common.remove);
         const centre = gui.vec2(x + width - remove_size / 2, y + row / 2);
-        gui.cross(list, centre, gui.px(remove_arm), gui.px(remove_thickness), if (hovered) theme.text else theme.text_tertiary);
+        gui.cross(list, centre, gui.px(remove_arm), gui.px(remove_thickness), if (hovered) theme.colors.text else theme.colors.text_tertiary);
         y += row + gui.px(metadata_gap);
     }
     if (add) state.focus_new_field = true;
@@ -1047,59 +1069,26 @@ fn metadataCheck(list: *c.ImDrawList, x: f32, y: f32, label: [:0]const u8, flag:
     const hovered = c.ImGui_IsItemHovered(0);
     const box = gui.vec2(x + gui.px(metadata_check_inset), y + (row - gui.px(metadata_check)) / 2);
     gui.checkBox(list, box, gui.px(metadata_check), flag.*, hovered);
-    c.ImDrawList_AddText(list, gui.vec2(x + gui.px(metadata_check_width + metadata_spacing), y + (row - c.ImGui_GetFontSize()) / 2), theme.imU32(if (hovered) theme.text else theme.text_secondary), label);
+    c.ImDrawList_AddText(list, gui.vec2(x + gui.px(metadata_check_width + metadata_spacing), y + (row - c.ImGui_GetFontSize()) / 2), theme.imU32(if (hovered) theme.colors.text else theme.colors.text_secondary), label);
 }
 
-/// Draws the field for one of the roll's details. It shows the roll's value except while you're
-/// typing in it, and saves the roll when you leave it.
+/// Draws the box for one of the roll's details at `at`, `width` pixels wide.
 fn detailField(state: *State, ctx: context.Context, r: *roll.Roll, which: roll.Detail, at: gui.Vec2, width: f32) void {
-    const buffer = state.details.getPtr(which);
-    const value = r.detail(which) orelse "";
-    // A value too long for the box can't be edited here, so a shortened copy never gets saved
-    // over it.
-    const fits = value.len <= buffer.len;
-    if (!state.isEditing(.{ .detail = which })) showCut(buffer, value);
     c.ImGui_SetCursorScreenPos(at);
     c.ImGui_PushStyleVarImVec2(c.ImGuiStyleVar_FramePadding, gui.vec2(gui.px(field_padding), (gui.px(detail_row) - c.ImGui_GetFontSize()) / 2));
-    c.ImGui_BeginDisabled(!fits);
-    var committed = false;
-    const kind = minilab.saved_details.Kind.fromDetail(which);
-    if (kind) |k| {
-        const edit = saved_details.field(&state.saved, &ctx.library.saved_details, k, @tagName(which), buffer, "Not set", width / gui.scale);
-        if (edit.active) state.editing = .{ .detail = which } else if (state.isEditing(.{ .detail = which })) {
-            state.editing = null;
-        }
-        committed = edit.committed;
-    } else {
-        _ = gui.textField(@tagName(which), buffer, "Not set", width / gui.scale);
-        committed = trackEdit(state, .{ .detail = which });
-    }
-    c.ImGui_EndDisabled();
-    c.ImGui_PopStyleVar();
-    if (which == .shot) gui.tooltip("YYYY, YYYY-MM or YYYY-MM-DD");
-    if (committed and fits) {
-        const text = std.mem.sliceTo(buffer, 0);
-        r.setDetail(ctx.io, which, text) catch |err| {
-            std.log.err("can't save {s}'s {t}: {t}", .{ r.info.name, which, err });
-            ctx.notice.set("Roll detail could not be saved", .{});
-            return;
-        };
-        if (kind) |k| ctx.library.saved_details.remember(ctx.io, k, text) catch |err| {
-            std.log.warn("roll detail saved, but suggestions were not updated: {t}", .{err});
-            ctx.notice.set("Roll detail saved; saved entries could not be updated", .{});
-        };
-    }
+    defer c.ImGui_PopStyleVar();
+    state.details.draw(which, r, ctx.library, ctx.io, i18n.t.common.not_set, width / gui.scale);
 }
 
-/// Notes which field is being typed in, from the item just drawn. Returns true when you've just
-/// left it after changing it, which is when it's saved.
-fn trackEdit(state: *State, which: Editing) bool {
-    if (c.ImGui_IsItemActive()) {
+/// Notes whether field `which` is being typed in, from `edit`. Returns true when it's done with
+/// after a change (you left it, or picked a suggestion), which is when it's saved.
+fn trackEdit(state: *State, which: Editing, edit: gui.TextEdit) bool {
+    if (edit.active) {
         state.editing = which;
     } else if (state.isEditing(which)) {
         state.editing = null;
     }
-    return c.ImGui_IsItemDeactivatedAfterEdit();
+    return edit.done;
 }
 
 /// Fills the fields' boxes from the roll, unless one of them is being typed in.
@@ -1108,19 +1097,9 @@ fn syncFields(state: *State, gpa: std.mem.Allocator, r: *const roll.Roll) void {
     state.custom.resize(gpa, r.info.fields.len) catch return;
     for (state.custom.items, r.info.fields) |*boxes, field| {
         boxes.fits = field.name.len <= boxes.name.len and field.value.len <= boxes.value.len;
-        showCut(&boxes.name, field.name);
-        showCut(&boxes.value, field.value);
+        roll_details.showCut(&boxes.name, field.name);
+        roll_details.showCut(&boxes.value, field.value);
     }
-}
-
-/// Puts `value` into a text box, cut short at a whole character if it doesn't fit. Only for
-/// showing: a box holding a cut value mustn't be saved.
-fn showCut(buffer: [:0]u8, value: []const u8) void {
-    var end = @min(value.len, buffer.len);
-    // Back off to the start of a character, so the cut doesn't split one.
-    while (end < value.len and end > 0 and value[end] & 0xc0 == 0x80) end -= 1;
-    @memcpy(buffer[0..end], value[0..end]);
-    buffer[end] = 0;
 }
 
 /// Saves the fields as they're typed, leaving out `remove` and adding an empty one for `add`.
@@ -1154,28 +1133,17 @@ fn start(state: *State, ctx: context.Context, r: *const roll.Roll) void {
         .folder = folder,
         .stock_curves = ctx.library.stockCurves(r, r.info.kind),
     }) catch |err| {
-        ctx.notice.set("Can't export · {t}", .{err});
+        ctx.notice.set("{s}", .{gui.say(i18n.t.@"export".cant_export, .{@errorName(err)})});
         return;
     };
     const future = ctx.io.concurrent(exporting.Batch.run, .{ batch, ctx.gpa, ctx.io }) catch |err| {
         batch.destroy(ctx.gpa);
-        ctx.notice.set("Can't start export · {t}", .{err});
+        ctx.notice.set("{s}", .{gui.say(i18n.t.@"export".cant_start, .{@errorName(err)})});
         return;
     };
     var running: Running = .{ .batch = batch, .future = future };
     running.what.set("{s}, {s}", .{ state.file.label(), spaceLabel(state.space) });
     state.running = running;
-}
-
-test "a value cut short for showing keeps whole characters" {
-    var box: [6:0]u8 = @splat(0);
-    showCut(&box, "Gent");
-    try std.testing.expectEqualStrings("Gent", std.mem.sliceTo(&box, 0));
-    // "è" is two bytes, the sixth and seventh, so a cut after six would split it.
-    showCut(&box, "Gentsè, Belgium");
-    try std.testing.expectEqualStrings("Gents", std.mem.sliceTo(&box, 0));
-    showCut(&box, "Ghent, Belgium");
-    try std.testing.expectEqualStrings("Ghent,", std.mem.sliceTo(&box, 0));
 }
 
 test "a custom long edge is a number within range, or nothing" {

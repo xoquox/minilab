@@ -5,33 +5,36 @@
 </p>
 
 This fork of [minilab](https://github.com/vdmkenny/minilab) is adapted primarily for the
-**Epson Perfection V600 Photo on Linux**. It keeps the
-original scanning, developing and export workflow, with the additions below. The V600-specific
-changes have not been validated on other scanners or platforms.
+**Epson Perfection V600 Photo on Linux**. It is based on upstream 0.8.0 and the newer generic
+infrared work on upstream main. The V600-specific additions have not been validated on other
+scanners or platforms.
 
-## Changes in this version
+## Additions in this fork
 
-- **Separate X and Y resolutions:** native resolution menus for SANE drivers that expose both
-  axes. The V600's epkowa driver can offer up to 6400 dpi in X and 9600 dpi in Y. Unequal-axis
-  scans keep the original native TIFF alongside a square-pixel working image. Accepted driver
-  settings alone do not confirm image quality at every resolution.
-- **V600 infrared dust removal:** a separate Linux helper captures RGB and infrared data using
-  Epson Scan 2's command library. The roll keeps the original scan, the IR image and a separate
-  correction that can be switched off in Develop. This uses minilab's own correction, not Epson's
-  Digital ICE. IR capture supports 800, 1600 and 3200 dpi; hardware validation so far was at
-  800 dpi. See [driver setup and limitations](docs/infrared.md).
-- **Saved roll details:** Camera, Lens and Copyright fields accept new values or selections
-  from earlier entries. A manager adds and removes suggestions without changing existing roll
-  metadata. See [saved entries](docs/saved-roll-details.md).
-- **Light appearance:** a persistent Light / Dark selector, with neutral grey surfaces and
-  pastel green main buttons in Light mode. See [appearance](docs/appearance.md).
+- **Native X and Y resolutions:** separate SANE resolution controls, up to 6400 dpi in X and
+  9600 dpi in Y when the V600's epkowa driver accepts them at the requested depth. Rectangular
+  captures keep their native TIFF alongside a square-pixel working copy. See
+  [axis resolutions](docs/axis-resolutions.md) and [upstream PR #73](https://github.com/vdmkenny/minilab/pull/73).
+- **V600 SDK infrared capture:** the optional Linux helper uses Epson Scan 2's command library
+  for separate RGB and IR passes at 800, 1600 or 3200 dpi. This stays in the fork; upstream
+  declined that driver dependency. Existing originals, infrared planes and reversible corrected
+  copies remain supported. See [V600 driver setup and limits](docs/v600-infrared.md).
+- **Existing preferences:** the old fork's `theme` setting is read when no newer `appearance`
+  choice has been saved, so an existing Light choice survives the update.
 
-The V600 setup needs working SANE/epkowa drivers. Infrared capture additionally needs Epson's
-interpreter, firmware and command library; those proprietary files are not included here.
-Build this repository to get these changes. The original project's website and downloads
-describe upstream minilab and do not include this fork's additions.
+The interface now follows upstream 0.8.0. Appearance and language are in **Settings** (the gear),
+with neutral colours and an optional always-dark viewer. Camera, lens and copyright suggestions
+come from the library's rolls, with completion and the new roll-details editor. The fork's old
+separate suggestion manager is no longer used; an existing `roll-details.json` is left untouched.
+See [settings](docs/settings.md) for the current appearance controls. Upstream's general
+[infrared processing](docs/infrared.md) is separate from the fork's SDK capture and correction.
+
+The V600 needs working SANE/epkowa drivers. SDK capture also needs Epson's interpreter, firmware
+and command library; proprietary driver files are not included. Build this repository for the
+fork's additions. Upstream downloads provide the upstream application.
 
 ## About minilab
+
 
 **minilab** is a cross-platform app for scanning, developing and exporting film, a roll at a
 time. Whether you scan on a flatbed, photograph your negatives with a camera, or already have
@@ -55,16 +58,10 @@ Written in **Zig 0.17** with a **Dear ImGui** interface. For how it works inside
 - **Frame detection:** finds the frames on a scanner preview, a strip scan or a camera shot, with
   several strips side by side in a flatbed's film holder.
 - **One workflow:** scanning, inversion, colour correction and batch export in one app.
-- **Reusable roll details:** type cameras, lenses and copyright names, or choose from
-  [saved entries](docs/saved-roll-details.md). Manage the suggestions separately from roll metadata.
-- **Light and dark appearance.** Switch from the selector in the top-right corner. Your choice
-  is remembered across libraries. See [appearance](docs/appearance.md).
 - **Datasheet corrections:** the film's datasheet curves open up crushed shadows and keep them
   neutral.
 - **Dust removal:** finds dust on a scan and fills it in with the film's own grain, with limits
   that keep small lights in the picture.
-  The Epson V600 on Linux can also use a [separate infrared scan](docs/infrared.md), keeping the
-  original and a correction you can turn off in Develop.
 - **Film looks:** Frontier lab emulation, 85 film looks from three free collections, and your own
   `.cube` LUTs (3D or 1D).
 - **Fitted looks:** a look that matches your lab, made from a few frames scanned by both.
@@ -76,13 +73,11 @@ Written in **Zig 0.17** with a **Dear ImGui** interface. For how it works inside
 
 ## Installation
 
-For this V600 version, follow [Building it yourself](#building-it-yourself) and the
-[infrared driver setup](docs/infrared.md#driver-setup).
+For this V600 fork, follow [Building it yourself](#building-it-yourself) and the
+[V600 driver setup](docs/v600-infrared.md#driver-setup). The downloads below are upstream builds.
 
-For upstream minilab, download the archive for your platform from
-[the website](https://vdmkenny.github.io/minilab/#download) or the
-[upstream releases](https://github.com/vdmkenny/minilab/releases/latest).
-There are builds for Windows, macOS and Linux, on
+Download the archive for your platform from [the website](https://vdmkenny.github.io/minilab/#download)
+or the [latest release](../../releases/latest). There are builds for Windows, macOS and Linux, on
 x86-64 and Arm, with a file of checksums to check your download against.
 
 ### macOS
@@ -236,32 +231,8 @@ negatives) untouched, so minilab can measure it in the gaps between frames.
 For the Epson Perfection V200 that comes from a profile we measured. For any other scanner,
 minilab works it out from the driver's own settings: gamma 1.0, colour correction off and the
 film type on positive. The box under the scanner's name on the Scan screen says what it managed.
-If it got something wrong for your scanner, open **Scanner settings** and pick another value for
-any of them. Your changes are saved per scanner, and Reset puts the scanner back on Auto.
-
-### Separate X and Y resolutions
-
-On SANE scanners with separate resolution controls, Scan also shows native X and Y menus.
-For an Epson V600 with the epkowa driver, these can reach 6400 and 9600 dpi respectively.
-Only resolutions the driver accepts without rounding or dropping the bit depth are listed.
-The ordinary resolution menu still requests the same resolution in both directions.
-
-When X and Y differ, the roll keeps two files in `scans/`: the untouched native pixel grid
-in a `.native.tiff`, with separate TIFF resolution tags, and a square-pixel working scan.
-The working scan interpolates only the lower-density axis to the higher density. It does
-not add optical detail, but keeps the native detail from both axes while maintaining the
-correct proportions in frame detection, Develop and exports. The frame's JSON records
-`native_scan` and `capture_dpi`. A square-pixel capture keeps the existing single-file layout.
-
-The command line can save a native TIFF directly:
-
-```sh
-minilab scan frame.tiff --dpi 6400 --dpi-y 9600
-```
-
-Different X and Y resolutions require a TIFF destination because PPM cannot record their
-pixel aspect ratio. A setting accepted by a driver still needs a scan on that hardware to
-confirm the resulting image. Scanner options alone do not start a scan.
+If it got something wrong for your scanner, open Settings › **Scanner** (the gear next to the
+scanner's name) and pick another value for any of them. Your changes are saved per scanner, and Reset puts the scanner back on Auto.
 
 ## Licence
 

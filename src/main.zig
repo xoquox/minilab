@@ -2,6 +2,7 @@
 //! command on the command line.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const minilab = @import("minilab");
 const app = @import("app/app.zig");
 pub const version = @import("version.zig");
@@ -17,6 +18,8 @@ const usage =
     \\      [--workspace <name>]         start in rolls, scan, develop, export or looks
     \\      [--shortcuts]                show the keyboard shortcuts
     \\      [--screenshot <file.png>]    draw the screen without a window and save it
+    \\      [--language <code>]          the interface's language for this run: en, nl, fr, de,
+    \\                                   it, es or ja. A screenshot is in English otherwise
     \\  minilab import <roll name> <scan or folder>...
     \\      [--library <folder>] [--stock <name>] [--film colour|bw|slide]
     \\      [--flat <file>] [--move]     add scans to a roll, and make the roll if it doesn't exist
@@ -288,6 +291,17 @@ fn scanCommand(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !
     defer scanner.close();
     var capabilities = try scanner.capabilities(gpa, if (flatbed) .flatbed else .transparency);
     defer capabilities.deinit(gpa);
+    if (!infrared) if (dpi_y) |vertical| {
+        if (capabilities.axis_resolutions == null) {
+            std.log.err("{s} {s} does not expose separate X/Y resolution controls for this source; omit --dpi-y", .{ device.vendor, device.model });
+            return error.Unsupported;
+        }
+        if (!capabilities.hasAxisResolution(.{ dpi, vertical })) {
+            std.log.err("{s} {s} does not support the requested {d} x {d} dpi at the raw bit depth", .{ device.vendor, device.model, dpi, vertical });
+            return error.Unsupported;
+        }
+    };
+    if (infrared and !capabilities.infrared) return error.Unsupported;
     const resolution = if (dpi_y != null or infrared) dpi else capabilities.resolutionFrom(dpi) orelse return error.NoResolutions;
     var raw_buffer: [96]u8 = undefined;
     const setup = if (capabilities.profile) |p| p.summary else if (capabilities.options) |o| scan.rawSetup(o.items, &.{}).report.label(&raw_buffer) else "no profile: the data may not be linear";
@@ -310,7 +324,7 @@ fn scanCommand(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !
         const plane = try minilab.pnm.writeGray(gpa, ir);
         defer gpa.free(plane);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = infrared_path, .data = plane });
-        const cleaned = try minilab.infrared.clean(gpa, image.scan, ir, image.dpi[0]);
+        const cleaned = try minilab.sdk_infrared.clean(gpa, image.scan, ir, image.dpi[0]);
         corrected = cleaned.scan;
         std.log.info("Infrared correction: {d} pixels; original and IR saved", .{cleaned.pixels});
     }
@@ -358,8 +372,17 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 2 and std.mem.eql(u8, args[1], "looks")) return listLooks(init.io);
     const library = try defaultLibrary(arena, init.environ_map);
     const home = homeFolder(init.environ_map);
-    if (args.len < 2) return runApp(gpa, init.io, .{ .library = library, .home = home }, all_args);
-    if (std.mem.eql(u8, args[1], "open")) return runApp(gpa, init.io, parseOpen(arena, library, home, args[2..]) catch exitWithUsage(), all_args);
+    const preferences = try minilab.preferences.path(arena, builtin.os.tag, .{
+        .home = home,
+        .config_home = init.environ_map.get("XDG_CONFIG_HOME"),
+        .app_data = init.environ_map.get("APPDATA"),
+    });
+    if (args.len < 2) return runApp(gpa, init.io, .{ .library = library, .home = home, .preferences = preferences }, all_args);
+    if (std.mem.eql(u8, args[1], "open")) {
+        var options = parseOpen(arena, library, home, args[2..]) catch exitWithUsage();
+        options.preferences = preferences;
+        return runApp(gpa, init.io, options, all_args);
+    }
     if (std.mem.eql(u8, args[1], "develop-roll")) {
         return developRoll(gpa, init.io, args[2..]) catch |err| switch (err) {
             error.Usage => exitWithUsage(),
@@ -410,6 +433,8 @@ fn parseOpen(arena: std.mem.Allocator, library: []const u8, home: ?[]const u8, a
             options.shortcuts = true;
         } else if (eql(arg, "--screenshot")) {
             options.screenshot = try each.value();
+        } else if (eql(arg, "--language")) {
+            options.language = minilab.preferences.Language.ofCode(try each.value()) orelse return error.Usage;
         } else if (eql(arg, "--library")) {
             options.library = try each.value();
         } else if (eql(arg, "--roll")) {
@@ -811,9 +836,11 @@ test {
     _ = @import("app/frame.zig");
     _ = @import("app/holes.zig");
     _ = @import("platform/trash.zig");
+    _ = @import("platform/account.zig");
     _ = @import("app/scan_view.zig");
     _ = @import("app/scan_worker.zig");
     _ = @import("app/update_view.zig");
+    _ = @import("app/settings_view.zig");
     _ = @import("app/update_worker.zig");
     _ = @import("app/looks_view.zig");
     _ = @import("app/export_view.zig");
@@ -823,6 +850,8 @@ test {
     _ = @import("app/shortcuts.zig");
     _ = @import("ui/gui.zig");
     _ = @import("ui/theme.zig");
+    _ = @import("ui/icons.zig");
+    _ = @import("i18n/i18n.zig");
     _ = @import("platform/window.zig");
 }
 

@@ -1,144 +1,314 @@
-//! Application appearance, shared by all libraries on this user account.
-const std = @import("std");
+//! The app's preferences: how it looks and which language it speaks. Unlike a library's
+//! settings, they belong to the user's account and hold for every library, so they're kept in
+//! preferences.json in the account's configuration folder.
 
-pub const Theme = enum {
+const std = @import("std");
+const Io = std.Io;
+const json_file = @import("json_file.zig");
+
+pub const file_name = "preferences.json";
+/// The app's folder inside the account's configuration folder.
+const folder_name = "minilab";
+
+/// Light or dark interface, or whichever the system uses.
+pub const Appearance = enum {
+    system,
     dark,
     light,
 
-    pub fn label(theme: Theme) []const u8 {
-        return switch (theme) {
+    pub fn label(appearance: Appearance) [:0]const u8 {
+        return switch (appearance) {
+            .system => "System",
             .dark => "Dark",
             .light => "Light",
         };
     }
 };
 
-pub const file_name = "preferences.json";
-const max_bytes = 64 * 1024;
-const File = struct { theme: Theme = .dark };
+/// The languages the interface comes in. English is the one the others fall back to, for any
+/// message they don't have.
+pub const Language = enum {
+    en,
+    nl,
+    fr,
+    de,
+    it,
+    es,
+    ja,
 
-/// Resolves the account's configuration folder, independently of the library.
-/// Callers supply environment hints so tests never touch the user's settings.
-pub fn pathFor(gpa: std.mem.Allocator, os: std.Target.Os.Tag, home: ?[]const u8, config_home: ?[]const u8, app_data: ?[]const u8) !?[]u8 {
-    if (os == .windows) {
-        const base = app_data orelse return null;
-        return try std.fs.path.join(gpa, &.{ base, "minilab", file_name });
-    }
-    if (os == .macos) {
-        const base = home orelse return null;
-        return try std.fs.path.join(gpa, &.{ base, "Library", "Application Support", "minilab", file_name });
-    }
-    if (config_home) |base| if (std.fs.path.isAbsolute(base)) return try std.fs.path.join(gpa, &.{ base, "minilab", file_name });
-    const base = home orelse return null;
-    return try std.fs.path.join(gpa, &.{ base, ".config", "minilab", file_name });
-}
-
-pub const Settings = struct {
-    arena: std.heap.ArenaAllocator,
-    path: ?[]const u8 = null,
-    theme: Theme = .dark,
-    readable: bool = true,
-
-    pub fn load(gpa: std.mem.Allocator, io: std.Io, path: ?[]const u8) !Settings {
-        var settings: Settings = .{ .arena = .init(gpa) };
-        errdefer settings.deinit();
-        const name = path orelse return settings;
-        settings.path = try settings.arena.allocator().dupe(u8, name);
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, name, gpa, .limited(max_bytes)) catch |err| switch (err) {
-            error.FileNotFound => return settings,
-            else => {
-                settings.readable = false;
-                return settings;
-            },
+    /// The language's name in itself, as a list of languages shows it.
+    pub fn autonym(language: Language) [:0]const u8 {
+        return switch (language) {
+            .en => "English",
+            .nl => "Nederlands",
+            .fr => "Français",
+            .de => "Deutsch",
+            .it => "Italiano",
+            .es => "Español",
+            .ja => "日本語",
         };
-        defer gpa.free(bytes);
-        const file = std.json.parseFromSliceLeaky(File, settings.arena.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch {
-            settings.readable = false;
-            return settings;
-        };
-        settings.theme = file.theme;
-        return settings;
     }
 
-    pub fn deinit(settings: *Settings) void {
-        settings.arena.deinit();
-        settings.* = undefined;
+    /// The language with ISO 639-1 code `code`, like "nl" in the locale nl_BE, if there's one.
+    pub fn ofCode(code: []const u8) ?Language {
+        inline for (comptime std.enums.values(Language)) |language| {
+            if (std.ascii.eqlIgnoreCase(code, @tagName(language))) return language;
+        }
+        return null;
     }
 
-    /// Apply for this session even if the preference cannot be written. The UI
-    /// reports that failure, while an unreadable file remains untouched.
-    pub fn setTheme(settings: *Settings, io: std.Io, theme: Theme) !void {
-        settings.theme = theme;
-        if (!settings.readable) return error.PreferencesUnreadable;
-        const path = settings.path orelse return;
-        const gpa = settings.arena.child_allocator;
-        const bytes = try std.json.Stringify.valueAlloc(gpa, File{ .theme = theme }, .{ .whitespace = .indent_2 });
-        defer gpa.free(bytes);
-        const temporary = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
-        defer gpa.free(temporary);
-        const cwd = std.Io.Dir.cwd();
-        if (std.fs.path.dirname(path)) |folder| try cwd.createDirPath(io, folder);
-        errdefer cwd.deleteFile(io, temporary) catch {};
-        try cwd.writeFile(io, .{ .sub_path = temporary, .data = bytes });
-        try cwd.rename(temporary, cwd, path, io);
+    /// Whether its script needs a font beyond the interface's own, which covers Latin.
+    pub fn needsCjkFont(language: Language) bool {
+        return language == .ja;
     }
 };
 
-test "appearance survives restart and can be switched back" {
+/// The preferences, as preferences.json keeps them. The defaults are for a first start.
+pub const Preferences = struct {
+    /// Dark by default: a light interface around a photo makes it look darker and flatter than
+    /// it is (see docs/settings.md).
+    appearance: Appearance = .dark,
+    /// Keep the viewer's background dark even when the interface is light.
+    always_dark_viewer: bool = true,
+    /// The interface's language, or null for the system's.
+    language: ?Language = null,
+    /// The scanner picked last, to open again when several are connected.
+    scanner: ?Scanner = null,
+    /// The resolution previews are scanned at, or the scanner's next one up. Enough to find the
+    /// frames, and quick.
+    preview_dpi: u32 = 300,
+    /// The resolution scans start at, or the scanner's closest one. Enough for a 35mm frame to
+    /// print at about 30 by 20 cm.
+    scan_dpi: u32 = 2400,
+
+    /// A scanner, by its maker and model and its driver. Not by its device name, which can change
+    /// when it's plugged into another port.
+    pub const Scanner = struct {
+        /// The vendor and model, such as "Epson Perfection V600".
+        name: []const u8,
+        /// The driver: a SANE backend such as "epkowa", or "TWAIN".
+        driver: []const u8,
+
+        pub fn eql(a: Scanner, b: Scanner) bool {
+            return std.mem.eql(u8, a.name, b.name) and std.mem.eql(u8, a.driver, b.driver);
+        }
+
+        fn clone(scanner: Scanner, gpa: std.mem.Allocator) !Scanner {
+            const name = try gpa.dupe(u8, scanner.name);
+            errdefer gpa.free(name);
+            return .{ .name = name, .driver = try gpa.dupe(u8, scanner.driver) };
+        }
+
+        fn free(scanner: Scanner, gpa: std.mem.Allocator) void {
+            gpa.free(scanner.name);
+            gpa.free(scanner.driver);
+        }
+    };
+
+    /// Whether `a` and `b` are the same preferences, comparing the scanner's text.
+    pub fn eql(a: Preferences, b: Preferences) bool {
+        var plain_a = a;
+        var plain_b = b;
+        plain_a.scanner = null;
+        plain_b.scanner = null;
+        if (!std.meta.eql(plain_a, plain_b)) return false;
+        const sa = a.scanner orelse return b.scanner == null;
+        const sb = b.scanner orelse return false;
+        return sa.eql(sb);
+    }
+};
+
+/// What the configuration folder depends on, from the environment.
+pub const Environment = struct {
+    home: ?[]const u8 = null,
+    /// XDG_CONFIG_HOME, on Linux and the BSDs.
+    config_home: ?[]const u8 = null,
+    /// APPDATA, on Windows.
+    app_data: ?[]const u8 = null,
+};
+
+/// Where preferences.json goes on `os`: the folder the system keeps apps' settings in, or null
+/// when the environment doesn't say where that is.
+pub fn path(gpa: std.mem.Allocator, os: std.Target.Os.Tag, environment: Environment) !?[]u8 {
+    var parts: [5][]const u8 = undefined;
+    const base: usize = switch (os) {
+        .windows => base: {
+            parts[0] = environment.app_data orelse return null;
+            break :base 1;
+        },
+        .macos => base: {
+            parts[0..3].* = .{ environment.home orelse return null, "Library", "Application Support" };
+            break :base 3;
+        },
+        else => if (xdgConfigHome(environment)) |config| base: {
+            parts[0] = config;
+            break :base 1;
+        } else base: {
+            parts[0..2].* = .{ environment.home orelse return null, ".config" };
+            break :base 2;
+        },
+    };
+    parts[base..][0..2].* = .{ folder_name, file_name };
+    return try std.fs.path.join(gpa, parts[0 .. base + 2]);
+}
+
+/// XDG_CONFIG_HOME, unless it's relative: XDG says to ignore it then.
+fn xdgConfigHome(environment: Environment) ?[]const u8 {
+    const config = environment.config_home orelse return null;
+    return if (std.fs.path.isAbsolute(config)) config else null;
+}
+
+/// The preferences and the file they're kept in. The scanner's text belongs to it: call `deinit`.
+pub const Saved = struct {
+    values: Preferences = .{},
+    /// Where preferences.json is, or null when they aren't kept (as in screenshots and tests).
+    path: ?[]const u8 = null,
+
+    /// Reads the preferences at `file`. Without a file, or with one that can't be read, they're the
+    /// defaults. `file` has to outlive the result.
+    pub fn load(gpa: std.mem.Allocator, io: Io, file: ?[]const u8) !Saved {
+        var saved: Saved = .{ .path = file };
+        const at = file orelse return saved;
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        switch (try json_file.read(Preferences, arena.allocator(), io, at)) {
+            .read => |values| {
+                saved.values = values;
+                // The V600 fork used "theme" before adopting upstream preferences.
+                if (legacyAppearance(arena.allocator(), io, at) catch null) |appearance| saved.values.appearance = appearance;
+                // The arena goes, so the scanner's text is copied out of it.
+                saved.values.scanner = if (values.scanner) |s| try s.clone(gpa) else null;
+            },
+            .missing, .moved_aside => {},
+            .stuck => saved.path = null,
+        }
+        return saved;
+    }
+
+    /// Changes the preferences to `values` and writes them. They hold for this session even if
+    /// writing fails.
+    pub fn set(saved: *Saved, gpa: std.mem.Allocator, io: Io, values: Preferences) !void {
+        if (saved.values.eql(values)) return;
+        // Copied before the old one goes, since `values` may share it.
+        const scanner = if (values.scanner) |s| try s.clone(gpa) else null;
+        if (saved.values.scanner) |old| old.free(gpa);
+        saved.values = values;
+        saved.values.scanner = scanner;
+        const at = saved.path orelse return;
+        try json_file.write(gpa, io, at, saved.values);
+    }
+
+    pub fn deinit(saved: *Saved, gpa: std.mem.Allocator) void {
+        if (saved.values.scanner) |s| s.free(gpa);
+        saved.* = undefined;
+    }
+};
+
+/// Read the old fork's key only when the modern appearance key is absent.
+/// This leaves unknown keys and the file itself untouched until a normal save.
+fn legacyAppearance(arena: std.mem.Allocator, io: Io, at_file: []const u8) !?Appearance {
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, at_file, arena, .limited(json_file.max_bytes));
+    const Legacy = struct { appearance: ?std.json.Value = null, theme: ?std.json.Value = null };
+    const legacy = std.json.parseFromSliceLeaky(Legacy, arena, bytes, .{ .ignore_unknown_fields = true }) catch return null;
+    if (legacy.appearance != null) return null;
+    const theme = legacy.theme orelse return null;
+    return if (theme == .string) std.meta.stringToEnum(Appearance, theme.string) else null;
+}
+
+test "preferences survive a restart" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const folder = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(folder);
-    const path = try std.fs.path.join(gpa, &.{ folder, "config", file_name });
-    defer gpa.free(path);
-    {
-        var settings = try Settings.load(gpa, io, path);
-        defer settings.deinit();
-        try std.testing.expectEqual(Theme.dark, settings.theme);
-        try settings.setTheme(io, .light);
-    }
-    {
-        var settings = try Settings.load(gpa, io, path);
-        defer settings.deinit();
-        try std.testing.expectEqual(Theme.light, settings.theme);
-        try settings.setTheme(io, .dark);
-    }
-    var settings = try Settings.load(gpa, io, path);
-    defer settings.deinit();
-    try std.testing.expectEqual(Theme.dark, settings.theme);
+    const at = try std.fs.path.join(gpa, &.{ folder, folder_name, file_name });
+    defer gpa.free(at);
+
+    var first: Saved = try .load(gpa, io, at);
+    defer first.deinit(gpa);
+    try std.testing.expect(first.values.eql(.{}));
+    const v600: Preferences.Scanner = .{ .name = "Epson Perfection V600", .driver = "epkowa" };
+    try first.set(gpa, io, .{ .appearance = .light, .always_dark_viewer = false, .scanner = v600 });
+    var second: Saved = try .load(gpa, io, at);
+    defer second.deinit(gpa);
+    try std.testing.expect(second.values.eql(.{ .appearance = .light, .always_dark_viewer = false, .scanner = v600 }));
 }
 
-test "an unreadable preference still allows a session theme without replacing the file" {
+test "picking another scanner keeps its own copy of the name" {
+    const gpa = std.testing.allocator;
+    var saved: Saved = try .load(gpa, std.testing.io, null);
+    defer saved.deinit(gpa);
+    var name = "Epson Perfection V600".*;
+    try saved.set(gpa, std.testing.io, .{ .scanner = .{ .name = &name, .driver = "epkowa" } });
+    // The device list the name came from goes away.
+    @memset(&name, 0);
+    try std.testing.expectEqualStrings("Epson Perfection V600", saved.values.scanner.?.name);
+    // Setting the same values again, sharing the saved text, keeps it.
+    try saved.set(gpa, std.testing.io, saved.values);
+    try saved.set(gpa, std.testing.io, .{ .appearance = .light, .scanner = saved.values.scanner });
+    try std.testing.expectEqualStrings("epkowa", saved.values.scanner.?.driver);
+}
+
+test "without a file to keep them in, preferences still change for the session" {
+    var saved: Saved = try .load(std.testing.allocator, std.testing.io, null);
+    defer saved.deinit(std.testing.allocator);
+    try saved.set(std.testing.allocator, std.testing.io, .{ .appearance = .system });
+    try std.testing.expectEqual(Appearance.system, saved.values.appearance);
+}
+
+test "a locale's language code picks the language" {
+    try std.testing.expectEqual(Language.nl, Language.ofCode("nl").?);
+    try std.testing.expectEqual(Language.ja, Language.ofCode("JA").?);
+    try std.testing.expectEqual(@as(?Language, null), Language.ofCode("pt"));
+}
+
+test "the configuration folder follows the system" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { std.Target.Os.Tag, Environment, ?[]const []const u8 }{
+        .{ .linux, .{ .home = "/home/ada" }, &.{ "/home/ada", ".config" } },
+        .{ .linux, .{ .home = "/home/ada", .config_home = "/xdg" }, &.{"/xdg"} },
+        .{ .linux, .{ .home = "/home/ada", .config_home = "relative" }, &.{ "/home/ada", ".config" } },
+        .{ .macos, .{ .home = "/Users/ada" }, &.{ "/Users/ada", "Library", "Application Support" } },
+        .{ .windows, .{ .app_data = "C:\\Users\\ada\\AppData\\Roaming" }, &.{"C:\\Users\\ada\\AppData\\Roaming"} },
+        .{ .windows, .{ .home = "C:\\Users\\ada" }, null },
+        .{ .linux, .{}, null },
+    };
+    for (cases) |case| {
+        const found = try path(gpa, case[0], case[1]);
+        defer if (found) |f| gpa.free(f);
+        const base = case[2] orelse {
+            try std.testing.expectEqual(@as(?[]u8, null), found);
+            continue;
+        };
+        var parts: std.ArrayList([]const u8) = .empty;
+        defer parts.deinit(gpa);
+        try parts.appendSlice(gpa, base);
+        try parts.appendSlice(gpa, &.{ folder_name, file_name });
+        const expected = try std.fs.path.join(gpa, parts.items);
+        defer gpa.free(expected);
+        try std.testing.expectEqualStrings(expected, found.?);
+    }
+}
+
+test "the V600 theme preference migrates without overriding a later appearance choice" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = "{broken" });
-    const path = try tmp.dir.realPathFileAlloc(io, file_name, gpa);
-    defer gpa.free(path);
-    var settings = try Settings.load(gpa, io, path);
-    defer settings.deinit();
-    try std.testing.expectError(error.PreferencesUnreadable, settings.setTheme(io, .light));
-    try std.testing.expectEqual(Theme.light, settings.theme);
-    const bytes = try tmp.dir.readFileAlloc(io, file_name, gpa, .limited(max_bytes));
+    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = "{\"theme\":\"light\",\"future\":42}" });
+    const at_file = try tmp.dir.realPathFileAlloc(io, file_name, gpa);
+    defer gpa.free(at_file);
+    var saved = try Saved.load(gpa, io, at_file);
+    defer saved.deinit(gpa);
+    try std.testing.expectEqual(Appearance.light, saved.values.appearance);
+    var values = saved.values;
+    values.appearance = .dark;
+    try saved.set(gpa, io, values);
+    var reread = try Saved.load(gpa, io, at_file);
+    defer reread.deinit(gpa);
+    try std.testing.expectEqual(Appearance.dark, reread.values.appearance);
+    const bytes = try tmp.dir.readFileAlloc(io, file_name, gpa, .limited(json_file.max_bytes));
     defer gpa.free(bytes);
-    try std.testing.expectEqualStrings("{broken", bytes);
-}
-
-test "configuration paths follow the account rather than a roll library" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const base = try tmp.dir.realPathFileAlloc(io, ".", gpa);
-    defer gpa.free(base);
-    const path = (try pathFor(gpa, .linux, null, base, null)).?;
-    defer gpa.free(path);
-    const expected = try std.fs.path.join(gpa, &.{ base, "minilab", file_name });
-    defer gpa.free(expected);
-    try std.testing.expectEqualStrings(expected, path);
-    try std.testing.expectEqual(@as(?[]u8, null), try pathFor(gpa, .linux, null, "relative", null));
-    try std.testing.expectEqual(@as(?[]u8, null), try pathFor(gpa, .windows, base, null, null));
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "future") != null);
 }

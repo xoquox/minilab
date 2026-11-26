@@ -6,8 +6,10 @@ pub const image = @import("core/image.zig");
 pub const develop = @import("core/develop.zig");
 /// Finding dust on a scan and filling it in.
 pub const dust = @import("core/dust.zig");
-/// Correction guided by a separate infrared capture.
+/// Finding dust from a scan's infrared plane.
 pub const infrared = @import("core/infrared.zig");
+/// V600 SDK correction, retained for existing captures and their reversible copies.
+pub const sdk_infrared = @import("core/sdk_infrared.zig");
 pub const encode = @import("core/encode.zig");
 /// Showing film on screen the way it looks on a light table.
 pub const light_table = @import("core/light_table.zig");
@@ -16,10 +18,12 @@ pub const look = @import("core/look.zig");
 pub const calibration = @import("core/calibration.zig");
 /// Changes to how a scanner is set up for raw scans, per scanner.
 pub const scanner_settings = @import("core/scanner_settings.zig");
-/// Reusable camera, lens and copyright entries for rolls.
-pub const saved_details = @import("core/saved_details.zig");
-/// Appearance shared by all libraries in the user account.
+/// The app's preferences, the same in every library.
 pub const preferences = @import("core/preferences.zig");
+/// Calendar dates, as rolls keep them.
+pub const date = @import("core/date.zig");
+/// Small JSON settings files, read and written whole.
+pub const json_file = @import("core/json_file.zig");
 /// Medians, percentiles and histogram ranks.
 pub const stats = @import("core/stats.zig");
 /// Splitting work over the cores.

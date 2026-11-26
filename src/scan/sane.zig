@@ -826,7 +826,17 @@ pub const Scanner = struct {
             if (scanner.getNumber("x-resolution") != @as(f64, @floatFromInt(request.dpi)) or
                 scanner.getNumber("y-resolution") != @as(f64, @floatFromInt(request.dpi_y.?))) return error.Unsupported;
             if (request.deep and scanner.getNumber("depth") != @as(f64, 16)) return error.Unsupported;
-        } else if (!try scanner.setNumber("resolution", @floatFromInt(request.dpi))) return error.Unsupported;
+        } else {
+            // Axis controls can stay active after probing or a rectangular scan.
+            // Setting the common control alone need not change either axis.
+            const dpi: f64 = @floatFromInt(request.dpi);
+            if (!try scanner.setNumber("resolution", dpi)) return error.Unsupported;
+            for ([_][]const u8{ "x-resolution", "y-resolution" }) |name| {
+                if (try scanner.setNumber(name, dpi)) {
+                    if (scanner.getNumber(name) != dpi) return error.Unsupported;
+                }
+            }
+        }
 
         // Now the area. Move the far corner out of the way first, so the near corner can go
         // anywhere.
@@ -1151,4 +1161,61 @@ test "SANE's test backend scans, where libsane is installed" {
 test "every function compiles, on every platform" {
     std.testing.refAllDecls(Library);
     std.testing.refAllDecls(Scanner);
+}
+
+/// A backend whose active X/Y controls are independent of its common resolution.
+/// It reproduces the V600 failure without opening SANE or moving a scanner.
+const IndependentAxes = struct {
+    values: [5]Word = .{ 0, 300, 6400, 9600, 16 },
+    const descriptors = [_]OptionDescriptor{
+        number("resolution", &.{ 3, 300, 2400, 6400 }),
+        number("x-resolution", &.{ 3, 300, 2400, 6400 }),
+        number("y-resolution", &.{ 4, 300, 2400, 6400, 9600 }),
+        number("depth", &.{ 2, 8, 16 }),
+    };
+
+    fn number(name: [*:0]const u8, choices: []const Word) OptionDescriptor {
+        return .{ .name = name, .title = null, .desc = null, .type = .int, .unit = .none, .size = @sizeOf(Word), .cap = cap_soft_select, .constraint_type = .word_list, .constraint = .{ .word_list = choices.ptr } };
+    }
+    fn descriptor(_: Handle, index: Int) callconv(.c) ?*const OptionDescriptor {
+        if (index < 1 or index > descriptors.len) return null;
+        return &descriptors[@intCast(index - 1)];
+    }
+    fn control(handle: Handle, index: Int, action: Action, value: ?*anyopaque, _: ?*Int) callconv(.c) Status {
+        const backend: *IndependentAxes = @ptrCast(@alignCast(handle));
+        const word: *Word = @ptrCast(@alignCast(value orelse return .inval));
+        if (index == 0) {
+            word.* = descriptors.len + 1;
+            return .good;
+        }
+        if (index < 0 or index >= backend.values.len) return .inval;
+        switch (action) {
+            .get_value => word.* = backend.values[@intCast(index)],
+            .set_value => backend.values[@intCast(index)] = word.*,
+            else => return .unsupported,
+        }
+        return .good;
+    }
+};
+
+test "square scans and previews reset active axes after capability probing and native scans" {
+    const gpa = std.testing.allocator;
+    var backend: IndependentAxes = .{};
+    var api: Api = undefined;
+    api.get_option_descriptor = IndependentAxes.descriptor;
+    api.control_option = IndependentAxes.control;
+    var scanner: Scanner = .{ .api = &api, .handle = @ptrCast(&backend), .profile = null };
+    var capabilities = try scanner.capabilities(gpa, .flatbed);
+    defer capabilities.deinit(gpa);
+    try std.testing.expect(capabilities.hasAxisResolution(.{ 6400, 9600 }));
+    try scanner.prepare(gpa, .{ .source = .flatbed, .dpi = 2400 });
+    try std.testing.expectEqual(@as(Word, 2400), backend.values[1]);
+    try std.testing.expectEqual(@as(Word, 2400), backend.values[2]);
+    try std.testing.expectEqual(@as(Word, 2400), backend.values[3]);
+    try scanner.prepare(gpa, .{ .source = .flatbed, .dpi = 6400, .dpi_y = 9600 });
+    try std.testing.expectEqual(@as(Word, 6400), backend.values[2]);
+    try std.testing.expectEqual(@as(Word, 9600), backend.values[3]);
+    try scanner.prepare(gpa, .{ .source = .flatbed, .dpi = 300 });
+    try std.testing.expectEqual(@as(Word, 300), backend.values[2]);
+    try std.testing.expectEqual(@as(Word, 300), backend.values[3]);
 }
