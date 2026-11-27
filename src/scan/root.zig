@@ -187,6 +187,9 @@ pub const Source = enum {
     /// Works out which source a library's name for it means, from the words in the name. Returns
     /// null for names with no words we recognise.
     pub fn classify(name: []const u8) ?Source {
+        // An infrared light source, like genesys's "Transparency Adapter Infrared", is for the
+        // infrared pass (`Capabilities.infrared`), never an ordinary scan.
+        if (isInfrared(name)) return null;
         const transparency_words = [_][]const u8{ "transparen", "film", "tpu", "slide", "negative", "positive", "tma", "tpa" };
         for (transparency_words) |word| if (containsIgnoreCase(name, word)) return .transparency;
         const feeder_words = [_][]const u8{ "adf", "feeder", "duplex" };
@@ -195,6 +198,11 @@ pub const Source = enum {
         return null;
     }
 };
+
+/// Whether a scanner's name for a mode, a source or an option is about infrared.
+pub fn isInfrared(name: []const u8) bool {
+    return containsIgnoreCase(name, "infrared") or containsIgnoreCase(name, "infra-red");
+}
 
 /// The scanner's own film setting. Scanners that have one adjust their exposure per channel for
 /// the orange mask when it's set to `negative`. `positive` leaves the channels alone.
@@ -245,13 +253,15 @@ pub const Capabilities = struct {
     deep: bool,
     /// Whether it has a film setting (`Film`).
     film_setting: bool,
+    /// Whether it can scan an infrared pass with each scan (`Request.infrared`), for infrared
+    /// dust removal.
+    infrared: bool = false,
+    sdk_infrared: bool = false,
     /// The settings that make this model's data linear, if we've measured them.
     profile: ?*const Profile,
     /// Without a profile, the options raw setup reads (`rawSetup`). Empty with a profile, and on
     /// TWAIN, which doesn't list its options.
     options: ?Owned(OptionInfo) = null,
-    /// Separate RGB and infrared capture through the optional Epson helper.
-    infrared: bool = false,
 
     /// Whether the current source offers each requested axis without rounding.
     pub fn hasAxisResolution(capabilities: Capabilities, dpi: [2]u32) bool {
@@ -297,12 +307,15 @@ pub const Request = struct {
     dpi_y: ?u32 = null,
     /// 16 bits per channel if the scanner has them, otherwise 8.
     deep: bool = true,
-    infrared: bool = false,
     /// What to scan, or null for the source's whole area.
     area: ?Area = null,
     /// The scanner settings' changes to raw setup. They're borrowed, so they have to last until
     /// the scan is done.
     raw: []const RawSetting = &.{},
+    /// Whether to scan an infrared pass too, when the scanner can (`Capabilities.infrared`).
+    infrared: bool = false,
+    /// Fail rather than silently falling back if the selected SDK becomes unavailable.
+    sdk_infrared: bool = false,
 };
 
 /// A scan as the scanner delivered it: RGB, and linear if the scanner's profile makes it so.
@@ -315,13 +328,13 @@ pub const Image = struct {
     dpi: [2]f32,
     /// The area the scanner used. It may have rounded the area we asked for.
     area: Area,
-
-    /// A separate, registered transmission plane. It has the colour scan's dimensions.
-    infrared: ?image.Gray = null,
+    /// The infrared pass, the size of `scan`, when the request asked for one and the scanner gave
+    /// it.
+    infrared: ?image.Plane = null,
 
     pub fn deinit(picture: *Image, gpa: std.mem.Allocator) void {
         picture.scan.deinit(gpa);
-        if (picture.infrared) |*ir| ir.deinit(gpa);
+        if (picture.infrared) |*plane| plane.deinit(gpa);
         picture.* = undefined;
     }
 };

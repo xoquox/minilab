@@ -28,3 +28,7 @@ a scanner, a native pair is kept only if the new source offers both values.
 Normal scans and previews explicitly reset active X/Y controls to the common dpi.
 If saving the native archive fails, the app reports that failure and keeps the
 working frame with its crop and turns.
+
+When an infrared pass is available, its native grid is also archived as a
+`.native.ir.tif`. The working plane is resampled to the working RGB image
+before the roll aligns it. The estimate includes both infrared files as well.

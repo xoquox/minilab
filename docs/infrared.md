@@ -30,13 +30,47 @@ It doesn't suit every film:
   - as a fourth sample after red, green and blue, when it isn't marked as alpha (an alpha sample
     stays alpha). VueScan writes these without the ExtraSamples tag that should describe the
     fourth sample, so a missing or "unspecified" one counts as infrared;
-  - as a later page of the same size, flagged as a mask, as SilverFast's HDRi files have it.
+  - as a later page of the same size, flagged as a mask, as SilverFast's HDRi files have it;
+  - in a 16-bit greyscale TIFF of its own, next to the scan. Software that saves it this way, like
+    VueScan's "16 bit Infrared" output, lets you name the file, so minilab's rule is the scan's
+    name with an infrared marker before the extension: `scan0001_ir.tif` for `scan0001.tif`, and
+    `-ir`, `.ir`, ` ir` or `_infrared` work too, in any case. A file like that is never imported
+    as a frame of its own when its scan is beside it, so a whole folder can be imported as it is.
 - **The cleaning** (`core/infrared.zig`), below.
+- **Develop.** A frame whose scan has a plane gets a choice under Remove dust: Find with Infrared
+  or Shape. It starts on Infrared, unless the roll's stock is silver black and white. Infrared has
+  two sliders, Threshold and Grow. The viewer and the loupe clean with the plane too, and the info
+  line says "+ IR". Frames without a plane look as they always did.
+- **Show what's removed.** The eye on Remove dust's heading tints everything dust removal
+  changes in amber, in the viewer and the loupe, with either finder.
+- **Warnings.** On silver black and white the choice is greyed out and says why; on Kodachrome it
+  warns that fine detail may soften; and a plane that turns out not to be a map of dust says so,
+  and the frame is left as it is.
 - **Export.** With dust removal on and its finder set to infrared, export cleans with the plane,
   cropped, turned and reduced the same way as the scan.
 
-Still to come: the controls in Develop, the loupe and the viewer, and scanners. Until then the
-finder can only be set in a frame's file (`"dust": {"remove": true, "finder": "infrared"}`).
+- **Scanning.** A scanner whose SANE driver offers infrared gets an Infrared pass check box on
+  Scan, off to begin with. With it on, each frame is scanned with its infrared, which goes into
+  the roll with the frame. SANE has no standard for infrared yet, so minilab looks for it in each
+  of the ways drivers offer it, by their options rather than by their names, so any driver that
+  does it one of these ways works:
+
+  | The driver offers | Like | The infrared comes |
+  | --- | --- | --- |
+  | a scan mode named infrared | epson2 (with our patch), pixma for the CanoScan 9000F | as a second scan of the same area, in grey |
+  | a light source named infrared | genesys for the Plustek OpticFilm 7200i to 8200i and Canon 8400F/8600F | as a second scan, from that light |
+  | an `RGBI` mode | pieusb for Reflecta and PIE | as a fourth sample with each pixel |
+  | an `infrared` or `infra-red` switch | coolscan2 for Nikon, avision | as a fourth sample, or a grey frame after the colour |
+
+  A second scan that comes out another size than the colour one is left out, with a note in the
+  log. epson2 had its infrared code switched off; `scripts/sane-patches` turns it on, in the
+  macOS download's SANE and, once it's taken, upstream. None of these has been tried on a real
+  scanner yet, so each needs checking. TWAIN's infrared pixel type isn't used yet: no film
+  scanner's TWAIN driver was found that offers it.
+
+Which films suit infrared comes from the stock presets: each says what its picture is made of
+(`material`: dye, or silver for black and white unless it says otherwise, as XP2 does), and
+Kodachrome says it's poor for infrared (`presets/stocks.zig`).
 
 ## How it works
 

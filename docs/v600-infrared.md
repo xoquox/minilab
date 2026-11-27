@@ -1,72 +1,68 @@
 # Epson V600 SDK infrared capture
 
-This is a fork-specific capture path, kept alongside upstream's generic infrared processing
-(`infrared.md`). Its original and corrected RGB copies remain compatible with the earlier
-V600 version of this fork. Upstream does not include this Epson SDK dependency.
+This fork keeps an optional Epson V600/GT-X820 capture path on Linux. Upstream
+0.9.0 scans IR through drivers that expose it openly; this path uses Epson Scan 2
+for a V600 opened through epkowa. Proprietary driver files are not included.
 
-On Linux, the Scan workspace can capture the V600's infrared channel alongside
-its colour image. Turn on **Infrared dust removal** before scanning frames.
-Previews still use SANE. Infrared capture uses square pixels at 800, 1600 or
-3200 dpi. Turning it off restores the normal resolution controls, including
-the scanner's separate X and Y resolutions.
+## New captures
 
-Use this with colour negatives and suitable colour slides. Silver-based B&W
-film and Kodachrome are unsuitable. The option is disabled for B&W rolls.
-Capture takes two passes, so it takes longer than a normal scan.
-Each intermediate raw file is limited to 512 MiB. Use frame-sized areas at higher resolutions.
+Select the V600 and turn on **Infrared pass** in Scan. SDK capture uses square
+pixels at 800, 1600 or 3200 dpi. It bypasses custom SANE raw settings and uses
+linear gamma with the colour matrix off. Previews still use SANE normally.
+Turning the pass off restores the ordinary and native X/Y resolution controls.
 
-The original RGB scan is kept unchanged. The roll also keeps a grayscale
-infrared PGM and a separate corrected TIFF. In Develop, **INFRARED DUST
-REMOVAL** switches between the original and corrected colour image, keeping
-your crop and develop settings. Thumbnails and exports follow that choice.
-The existing **REMOVE DUST** controls are a separate, image-based correction.
+The helper releases SANE's handle before taking separate RGB and IR passes.
+The RGB stays at the requested depth, including 16 bits. The SDK's 8-bit IR is
+widened losslessly to a 16-bit plane. A missing selected SDK or acquisition
+failure fails the frame instead of falling back silently to an RGB-only scan.
 
-The correction is minilab's own conservative dust mask and interpolation. It
-does not use Epson's Digital ICE image-processing plug-in. Small dark defects
-in infrared are masked, their edges are expanded slightly, and only those RGB
-pixels are filled from their surroundings. A mask covering more than 5% of the
-image is refused. Review fine detail and large defects before exporting.
-If that happens, the original and IR are still saved in the roll, and the
-queue reports that the correction was rejected.
+New captures now keep the unmodified RGB and the aligned IR plane in upstream's
+format, `scans/01.tif` and `scans/01.ir.tif`. Develop uses the normal 0.9.0 dust
+controls, including its IR threshold, grow and display of removed defects.
+Exports follow those settings. See [generic infrared processing](infrared.md).
+This uses minilab's own processing, not Epson Digital ICE.
+
+Each intermediate raw file is limited to 512 MiB. Use frame-sized areas at
+higher resolutions. Acquisition takes two passes. Silver-based B&W and
+Kodachrome are unsuitable for IR cleaning; chromogenic B&W can be suitable.
+Review fine detail and large defects before exporting.
+
+## Existing V600 captures
+
+Earlier versions of this fork stored an original RGB scan, an IR PGM and a
+precomputed corrected TIFF. Those files and their selection remain supported.
+**V600 IR CORRECTION (LEGACY)** switches those frames between their untouched
+original and the existing corrected copy, preserving crop and develop settings.
+The normal 0.9.0 controls apply to newly captured or imported IR planes.
 
 ## Driver setup
 
 The normal V600 SANE driver, including its interpreter, must already work.
-Install Epson Scan 2 with its non-free interpreter and firmware as well. None
-of those driver files are distributed with minilab.
-
-Linux builds install `minilab-epson-ir` next to `minilab`. Set these environment
-variables before starting the app:
+Install Epson Scan 2 with its non-free interpreter and firmware as well.
+Linux builds install `minilab-epson-ir` next to `minilab`. Set:
 
 ```sh
 export MINILAB_EPSON_IR_HELPER=/path/to/bin/minilab-epson-ir
 export MINILAB_EPSON_COMMAND_LIBRARY=/path/to/epsonscan2/libes2command.so
 ```
 
-On NixOS the helper needs the same dynamic-loader wrapper as minilab. Point
+On NixOS the helper needs the same dynamic-loader wrapper as minilab; point
 `MINILAB_EPSON_IR_HELPER` at that wrapper. The command library and its adjacent
-`non-free-exec/es2intif` must come from the same Epson installation.
+`non-free-exec/es2intif` must come from the same Epson installation. The helper
+matches the selected USB address to its serial and refuses ambiguous devices.
+Driver failures stay in the helper process rather than terminating the app.
 
-The option appears only for a V600 or GT-X820 opened through `epkowa`, when
-both paths exist. The helper matches the selected USB address to its serial
-number and refuses ambiguous devices without a serial. SANE releases its
-handle before the helper starts. An acquisition error or helper crash fails
-that frame without terminating the app or silently falling back to RGB-only.
-IR capture uses linear gamma and no colour matrix, rather than custom SANE
-raw settings. RGB stays at the requested depth, including 16 bits; Epson's IR
-pass is 8-bit and is stored losslessly widened to 16-bit.
-
-The command line also takes `--infrared`, defaulting to 800 dpi:
+The command line retains its older corrected-file and sidecar workflow:
 
 ```sh
 minilab scan frame.tiff --infrared --dpi 800 --area 10,30,10,10
 ```
 
-It saves the corrected image, `frame.tiff.original.tiff` and
-`frame.tiff.infrared.pgm`. The original and IR are saved before correction, so
-they remain available if the correction is refused.
+It saves the corrected output, `frame.tiff.original.tiff` and
+`frame.tiff.infrared.pgm`. Original and IR are saved before correction.
 
-The integration was checked with Epson Scan 2 6.7.70 and a real V600 at 800 dpi,
-with 16-bit RGB and a separate IR image. Larger scans and other film stocks
-need their own visual checks. The helper uses the Linux C++ binary interface
-declared by that Epson version; incompatible future versions may need changes.
+The SDK acquisition was checked with Epson Scan 2 6.7.70 and a real V600 at
+800 dpi with 16-bit RGB in the earlier fork. The 0.9.0 integration is covered
+by software tests; no new hardware scan was made during the update. Larger
+captures and other film stocks need visual checks. The SDK's Linux C++ binary
+interface is version-specific; future Epson releases may need changes.

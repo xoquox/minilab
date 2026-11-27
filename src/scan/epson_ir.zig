@@ -109,7 +109,10 @@ pub fn acquire(gpa: std.mem.Allocator, io: std.Io, device: scan.Device, request:
     const ir_bytes = std.Io.Dir.cwd().readFileAlloc(io, ir_path, a, .limited(max_file_bytes)) catch return error.Failed;
     var rgb = pnm.decode(gpa, rgb_bytes) catch return error.Failed;
     errdefer rgb.scan.deinit(gpa);
-    var infrared = pnm.readGray(gpa, ir_bytes) catch return error.Failed;
+    var grey = pnm.readGray(gpa, ir_bytes) catch return error.Failed;
+    defer grey.deinit(gpa);
+    var infrared = @import("../core/image.zig").Plane.init(gpa, grey.width, grey.height) catch return error.OutOfMemory;
+    for (infrared.pixels, grey.pixels) |*sample, value| sample.* = .{value};
     errdefer infrared.deinit(gpa);
     if (rgb.scan.width != pixels[2] or rgb.scan.height != pixels[3] or
         infrared.width != rgb.scan.width or infrared.height != rgb.scan.height or

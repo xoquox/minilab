@@ -170,19 +170,20 @@ pub fn reductionFactor(width: usize, height: usize, longest: usize) usize {
     return @max(1, (@max(width, height) + longest - 1) / longest);
 }
 
-/// Reduces `scan` by a whole-number factor so that its longer side is at most `longest`. Each
-/// pixel is the mean of the block it covers. A side shorter than the factor, on a very long thin
-/// scan, still gets one pixel, the mean of what's there.
-pub fn downscale(gpa: std.mem.Allocator, scan: Scan, longest: usize) !Scan {
+/// Reduces `scan`, a scan or a plane, by a whole-number factor so that its longer side is at most
+/// `longest`. Each pixel is the mean of the block it covers. A side shorter than the factor, on a
+/// very long thin scan, still gets one pixel, the mean of what's there.
+pub fn downscale(gpa: std.mem.Allocator, scan: anytype, longest: usize) !@TypeOf(scan) {
+    const Pixel = @typeInfo(@TypeOf(scan.pixels)).pointer.child;
     const factor = reductionFactor(scan.width, scan.height, longest);
-    var result: Scan = try .init(gpa, @max(1, scan.width / factor), @max(1, scan.height / factor));
+    var result: @TypeOf(scan) = try .init(gpa, @max(1, scan.width / factor), @max(1, scan.height / factor));
     for (0..result.height) |y| {
         const top = y * factor;
         const bottom = @min(top + factor, scan.height);
         for (result.row(y), 0..) |*p, x| {
             const left = x * factor;
             const right = @min(left + factor, scan.width);
-            var sum: [channel_count]u64 = @splat(0);
+            var sum: [@typeInfo(Pixel).array.len]u64 = @splat(0);
             for (top..bottom) |row| {
                 for (scan.row(row)[left..right]) |s| {
                     for (&sum, s) |*total, v| total.* += v;
@@ -316,13 +317,13 @@ test "a very long thin scan still downscales to a picture" {
 
 /// Makes square pixels at the higher sampling density. Only the less-dense axis grows;
 /// native scanner samples are archived separately before this working copy is made.
-pub fn squarePixels(gpa: std.mem.Allocator, source: Scan, dpi: [2]f32) !Scan {
+pub fn squarePixels(gpa: std.mem.Allocator, source: anytype, dpi: [2]f32) !@TypeOf(source) {
     const pixel_centre = 0.5;
     const target = @max(dpi[0], dpi[1]);
     if (!std.math.isFinite(dpi[0]) or !std.math.isFinite(dpi[1]) or dpi[0] <= 0 or dpi[1] <= 0 or source.width == 0 or source.height == 0) return error.InvalidResolution;
     const width: usize = @max(1, @as(usize, @intFromFloat(@round(@as(f64, @floatFromInt(source.width)) * target / dpi[0]))));
     const height: usize = @max(1, @as(usize, @intFromFloat(@round(@as(f64, @floatFromInt(source.height)) * target / dpi[1]))));
-    var result = try Scan.init(gpa, width, height);
+    var result = try @TypeOf(source).init(gpa, width, height);
     for (0..height) |y| {
         const sy = std.math.clamp((@as(f64, @floatFromInt(y)) + pixel_centre) * @as(f64, @floatFromInt(source.height)) / @as(f64, @floatFromInt(height)) - pixel_centre, 0, @as(f64, @floatFromInt(source.height - 1)));
         const y0: usize = @intFromFloat(sy);

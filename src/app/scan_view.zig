@@ -482,8 +482,10 @@ pub const State = struct {
     /// The resolution to scan at. It starts at the preferences' (`devices` sets it), or the
     /// scanner's closest one.
     dpi: u32 = (Preferences{}).scan_dpi,
-    dpi_y: ?u32 = null,
+    /// Whether frames are scanned with an infrared pass too, for scanners that can
+    /// (`scan.Capabilities.infrared`). It's off to begin with: it takes about twice as long.
     infrared: bool = false,
+    dpi_y: ?u32 = null,
     margin_mm: f32 = 1.0,
     margin_text: [16:0]u8 = @splat(0),
     editing_margin: bool = false,
@@ -692,18 +694,14 @@ fn handleEvent(state: *State, ctx: context.Context, worker: *Worker, event: *sca
         .frame_checking => |index| if (queueItem(state, index)) |item| {
             item.* = .checking;
         },
-        .frame_done => |done| {
-            defer event.deinit(gpa);
+        .frame_done => |*done| {
+            defer done.deinit(gpa);
             const item = queueItem(state, done.index);
-            const frame = addToRoll(state, ctx, done) catch |err| {
+            const frame = addToRoll(state, ctx, done.*) catch |err| {
                 std.log.err("can't add frame {d} to the roll: {t}", .{ done.index + 1, err });
                 if (item) |i| i.* = .{ .failed = err };
                 return;
             };
-            if (done.infrared_pgm != null and done.corrected_tiff == null) {
-                if (item) |i| i.* = .{ .failed = error.InfraredCorrectionRejectedOriginalSaved };
-                return;
-            }
             if (item) |i| i.* = if (done.refined) .{ .done = frame } else .{ .check_crop = frame };
             return;
         },
@@ -745,7 +743,7 @@ fn chooseDpi(capabilities: scan.Capabilities, current: u32, wanted: u32) u32 {
 
 /// Keep a native pair only while both axes remain available for the new source.
 fn validateDpi(state: *State, capabilities: scan.Capabilities, wanted: u32) void {
-    if (state.infrared and capabilities.infrared) {
+    if (state.infrared and capabilities.sdk_infrared) {
         state.dpi_y = null;
         if (std.mem.indexOfScalar(u32, &minilab.scan.sane_ir.resolutions, state.dpi) == null) state.dpi = 3200;
         return;
@@ -780,7 +778,7 @@ const StoredFrame = struct { frame: usize, native_failed: bool };
 
 /// Archive failures must not leave a working frame without its crop and turns.
 fn storeFrame(r: *roll.Roll, gpa: std.mem.Allocator, io: std.Io, done: scan_worker.Scanned, turns: u2) !StoredFrame {
-    const frame = try r.addScanAt(gpa, io, done.ppm, done.dpi);
+    const frame = try r.addScanAt(gpa, io, done.ppm, done.dpi, done.infrared);
     const saved = &r.frames.items[frame];
     var native_failed = false;
     if (done.native_tiff) |bytes| {
@@ -795,7 +793,18 @@ fn storeFrame(r: *roll.Roll, gpa: std.mem.Allocator, io: std.Io, done: scan_work
             native_failed = true;
         }
     }
-    if (done.infrared_pgm) |ir| try r.attachInfrared(gpa, io, frame, done.corrected_tiff, ir, done.infrared_pixels);
+    if (done.native_infrared_tiff) |bytes| {
+        const name = try std.fmt.allocPrint(r.arena.allocator(), "{s}.native.ir.tif", .{saved.scan.?});
+        const path = try std.fs.path.join(gpa, &.{ r.path, minilab.roll.scans_dir, name });
+        defer gpa.free(path);
+        if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes })) |_| {
+            saved.native_infrared = name;
+            saved.capture_dpi = done.capture_dpi;
+        } else |err| {
+            std.log.warn("working scan kept, but native infrared TIFF could not be saved: {t}", .{err});
+            native_failed = true;
+        }
+    }
     saved.crop = done.crop;
     saved.quarter_turns = turns;
     try r.saveFrame(io, frame);
@@ -919,8 +928,8 @@ fn drawScanner(state: *State, ctx: context.Context, roll_index: ?usize) void {
     y = drawDevice(state, panel, y);
     y = drawSetup(state, panel, y);
     y = drawFilmChoice(state, panel, y);
-    y = drawInfrared(state, panel, y);
     y = drawResolution(state, panel, y);
+    y = drawInfrared(state, panel, y);
     y = drawMargin(state, panel, y);
     y = drawFit(state, panel, y);
     drawActions(state, panel, y, origin.y + size.y - gui.px(panel_padding));
@@ -995,7 +1004,7 @@ fn menu(panel: ScannerPanel, y: f32, id: [:0]const u8, items: []const []const u8
 fn drawSetup(state: *State, panel: ScannerPanel, top: f32) f32 {
     const ctx = panel.ctx;
     var y = top;
-    if (state.infrared) return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.colors.text_secondary, "Raw RGB + infrared; SDK linear capture") + gui.px(scanner_gap);
+    if (state.infrared and if (state.capabilities) |caps| caps.sdk_infrared else false) return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.colors.text_secondary, "Raw RGB + infrared; SDK linear capture") + gui.px(scanner_gap);
     if (state.capabilities) |caps| {
         y += drawProfile(panel.list, panel.x, y, panel.width, caps, rawReport(state, ctx)) + gui.px(scanner_gap);
         return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.colors.text_tertiary, filmAreaNote(caps, ctx, panel.roll_index)) + gui.px(scanner_gap);
@@ -1040,34 +1049,12 @@ fn drawFilmChoice(state: *State, panel: ScannerPanel, top: f32) f32 {
     return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.colors.text_tertiary, film_note) + gui.px(scanner_gap);
 }
 
-fn drawInfrared(state: *State, panel: ScannerPanel, top: f32) f32 {
-    const caps = state.capabilities orelse return top;
-    if (!caps.infrared) {
-        state.infrared = false;
-        return top;
-    }
-    if (state.infrared and std.mem.indexOfScalar(u32, &minilab.scan.sane_ir.resolutions, state.dpi) == null) state.dpi = 3200;
-    const colour = state.film != .bw_negative and if (panel.roll_index) |r| panel.ctx.library.rolls.items[r].info.kind != .bw_negative else false;
-    if (!colour) state.infrared = false;
-    c.ImGui_SetCursorScreenPos(gui.vec2(panel.x, top));
-    c.ImGui_BeginDisabled(state.scanning or !colour);
-    if (gui.checkbox("Infrared dust removal", &state.infrared)) {
-        if (state.infrared) {
-            state.dpi_y = null;
-            if (std.mem.indexOfScalar(u32, &minilab.scan.sane_ir.resolutions, state.dpi) == null) state.dpi = 3200;
-        }
-    }
-    c.ImGui_EndDisabled();
-    gui.tooltip("Separate infrared scan. Color film only; unsuitable for silver B&W and Kodachrome.");
-    const note = if (!colour) "Color film only" else if (state.infrared) "Original and IR saved; correction can be turned off in Develop" else "800, 1600 or 3200 dpi";
-    return top + gui.px(pill_height + group_gap) + gui.paragraphAt(panel.list, panel.x, top + gui.px(pill_height + group_gap), panel.width, theme.colors.text_tertiary, note) + gui.px(scanner_gap);
-}
-
 /// Draws the resolution menu at `y`, with the size of the scans. Returns the y below.
 fn drawResolution(state: *State, panel: ScannerPanel, top: f32) f32 {
     var y = top;
     y += gui.lineAt(panel.list, panel.x, y, theme.colors.text_secondary, i18n.t.scan.resolution) + gui.px(group_gap);
-    const resolutions = if (state.infrared) &minilab.scan.sane_ir.resolutions else listedResolutions(state);
+    const sdk_ir = state.infrared and if (state.capabilities) |caps| caps.sdk_infrared else false;
+    const resolutions = if (sdk_ir) &minilab.scan.sane_ir.resolutions else listedResolutions(state);
     if (resolutions.len > 0) {
         var labels_: [max_resolutions][]const u8 = undefined;
         for (labels_[0..resolutions.len], resolutions) |*label, r| label.* = gui.print("{d} dpi", .{r});
@@ -1080,7 +1067,7 @@ fn drawResolution(state: *State, panel: ScannerPanel, top: f32) f32 {
         c.ImGui_EndDisabled();
         y += gui.px(device_height + group_gap);
     }
-    if (state.capabilities) |caps| if (!state.infrared) if (caps.axis_resolutions) |axes| {
+    if (state.capabilities) |caps| if (!sdk_ir) if (caps.axis_resolutions) |axes| {
         y += gui.lineAt(panel.list, panel.x, y, theme.colors.text_secondary, i18n.t.scan.native_resolution) + gui.px(group_gap);
         for (axes, 0..) |values, axis| {
             const listed = values[values.len -| max_resolutions..];
@@ -1103,6 +1090,23 @@ fn drawResolution(state: *State, panel: ScannerPanel, top: f32) f32 {
         y += gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.colors.text_tertiary, note) + gui.px(group_gap);
     };
     return y + gui.paragraphAt(panel.list, panel.x, y, panel.width, theme.colors.text_tertiary, sizeNote(state, panel.ctx, panel.roll_index)) + gui.px(scanner_gap);
+}
+
+/// Draws the switch for an infrared pass at `y`, for a scanner that can scan one. Returns the y
+/// below it.
+fn drawInfrared(state: *State, panel: ScannerPanel, y: f32) f32 {
+    const caps = state.capabilities orelse return y;
+    if (!caps.infrared) return y;
+    c.ImGui_SetCursorScreenPos(gui.vec2(panel.x, y));
+    c.ImGui_BeginDisabled(state.scanning);
+    const toggled = gui.checkbox(i18n.t.scan.infrared_pass, &state.infrared);
+    if (caps.sdk_infrared and state.infrared) {
+        state.dpi_y = null;
+        if (std.mem.indexOfScalar(u32, &minilab.scan.sane_ir.resolutions, state.dpi) == null) state.dpi = 3200;
+    } else if (toggled) validateDpi(state, caps, panel.ctx.preferences.values.scan_dpi);
+    c.ImGui_EndDisabled();
+    gui.tooltip(i18n.t.scan.infrared_pass_help);
+    return y + gui.px(pill_height + scanner_gap);
 }
 
 /// Draws the margin around the frames at `y`. Returns the y below it.
@@ -1528,15 +1532,15 @@ fn sizeNote(state: *const State, ctx: context.Context, roll_index: ?usize) []con
     along_mm += 2 * state.margin_mm;
     const width: u64 = @intFromFloat(@round(across_mm * dpi / mm_per_inch));
     const height: u64 = @intFromFloat(@round(along_mm * @as(f32, @floatFromInt(state.dpi_y orelse state.dpi)) / mm_per_inch));
-    const megabytes = labels.megabytes(captureBytes(width, height, .{ state.dpi, state.dpi_y orelse state.dpi }));
+    const megabytes = labels.megabytes(captureBytes(width, height, .{ state.dpi, state.dpi_y orelse state.dpi }, state.infrared and if (state.capabilities) |caps| caps.infrared else false));
     if (megabytes < 10) return gui.say(if (estimate) i18n.t.scan.size_about else i18n.t.scan.size, .{ width, height });
     return gui.say(if (estimate) i18n.t.scan.size_about_mb else i18n.t.scan.size_mb, .{ width, height, megabytes });
 }
 
 /// Uncompressed TIFF bytes: every stored raw scan has three 16-bit channels.
 /// Rectangular captures also keep the working copy at the higher density.
-fn captureBytes(width: u64, height: u64, dpi: [2]u32) u64 {
-    const bytes_per_pixel = image.channel_count * @sizeOf(u16);
+fn captureBytes(width: u64, height: u64, dpi: [2]u32, with_infrared: bool) u64 {
+    const bytes_per_pixel: u64 = (image.channel_count + @intFromBool(with_infrared)) * @sizeOf(u16);
     const native = width * height * bytes_per_pixel;
     if (dpi[0] == dpi[1]) return native;
     const target = @max(dpi[0], dpi[1]);
@@ -2451,7 +2455,7 @@ fn startScan(state: *State, ctx: context.Context, roll_index: ?usize) void {
         area = area.clip(caps.area) orelse caps.area;
         job.* = .{
             .index = i,
-            .request = .{ .source = caps.source, .film = scanner_film, .dpi = state.dpi, .dpi_y = state.dpi_y, .deep = caps.deep, .area = area, .infrared = state.infrared and caps.infrared and info.kind != .bw_negative },
+            .request = .{ .source = caps.source, .film = scanner_film, .dpi = state.dpi, .dpi_y = state.dpi_y, .deep = caps.deep, .area = area, .infrared = state.infrared and caps.infrared, .sdk_infrared = state.infrared and caps.sdk_infrared },
             .crop = crop,
             .refine = if (box.hand) null else .{ .format = info.format.format(), .kind = state.film.detectKind(), .axis = preview.axis, .holder = state.holder(), .fit = state.fit, .inset = box.inset / 100 },
         };
@@ -2640,7 +2644,6 @@ fn errorText(e: anyerror) []const u8 {
         error.Jammed => i18n.t.scan.errors.jammed,
         error.CoverOpen => i18n.t.scan.errors.cover_open,
         error.Unsupported => i18n.t.scan.errors.unsupported,
-        error.InfraredCorrectionRejectedOriginalSaved => "IR mask rejected; original saved",
         error.OutOfMemory => i18n.t.scan.errors.out_of_memory,
         error.NotFound => i18n.t.scan.errors.not_found,
         else => @errorName(e),
@@ -3217,9 +3220,10 @@ test "a native resolution survives reopen only while the source still offers bot
 }
 
 test "rectangular storage estimates count native and square-pixel TIFFs" {
-    try std.testing.expectEqual(@as(u64, 90), captureBytes(2, 3, .{ 6400, 9600 }));
-    try std.testing.expectEqual(@as(u64, 90), captureBytes(3, 2, .{ 9600, 6400 }));
-    try std.testing.expectEqual(@as(u64, 36), captureBytes(2, 3, .{ 6400, 6400 }));
+    try std.testing.expectEqual(@as(u64, 120), captureBytes(2, 3, .{ 6400, 9600 }, true));
+    try std.testing.expectEqual(@as(u64, 90), captureBytes(2, 3, .{ 6400, 9600 }, false));
+    try std.testing.expectEqual(@as(u64, 90), captureBytes(3, 2, .{ 9600, 6400 }, false));
+    try std.testing.expectEqual(@as(u64, 36), captureBytes(2, 3, .{ 6400, 6400 }, false));
 }
 
 test "native archive write failure still persists the working frame crop and turns" {

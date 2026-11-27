@@ -5,8 +5,8 @@
 </p>
 
 This fork of [minilab](https://github.com/vdmkenny/minilab) is adapted primarily for the
-**Epson Perfection V600 Photo on Linux**. It is based on upstream 0.8.0 and the newer generic
-infrared work on upstream main. The V600-specific additions have not been validated on other
+**Epson Perfection V600 Photo on Linux**. It is based on upstream 0.9.0, including its
+generic infrared capture, file import and Develop controls. The V600-specific additions have not been validated on other
 scanners or platforms.
 
 ## Additions in this fork
@@ -17,12 +17,12 @@ scanners or platforms.
   [axis resolutions](docs/axis-resolutions.md) and [upstream PR #73](https://github.com/vdmkenny/minilab/pull/73).
 - **V600 SDK infrared capture:** the optional Linux helper uses Epson Scan 2's command library
   for separate RGB and IR passes at 800, 1600 or 3200 dpi. This stays in the fork; upstream
-  declined that driver dependency. Existing originals, infrared planes and reversible corrected
+  declined that driver dependency. New captures feed upstream's IR processing. Existing originals, infrared planes and reversible corrected
   copies remain supported. See [V600 driver setup and limits](docs/v600-infrared.md).
 - **Existing preferences:** the old fork's `theme` setting is read when no newer `appearance`
   choice has been saved, so an existing Light choice survives the update.
 
-The interface now follows upstream 0.8.0. Appearance and language are in **Settings** (the gear),
+The interface now follows upstream 0.9.0. Appearance and language are in **Settings** (the gear),
 with neutral colours and an optional always-dark viewer. Camera, lens and copyright suggestions
 come from the library's rolls, with completion and the new roll-details editor. The fork's old
 separate suggestion manager is no longer used; an existing `roll-details.json` is left untouched.

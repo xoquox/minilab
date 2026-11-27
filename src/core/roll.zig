@@ -34,6 +34,8 @@ const icc = @import("../io/codecs/icc.zig");
 const formats = @import("../frames/formats.zig");
 const framing = @import("framing.zig");
 const infrared = @import("infrared.zig");
+const dust = @import("dust.zig");
+const stocks = @import("../presets/stocks.zig");
 const file_input = @import("input.zig");
 const FlatField = @import("flat_field.zig").FlatField;
 pub const Field = @import("export_metadata.zig").Field;
@@ -157,8 +159,9 @@ pub const FrameSettings = struct {
     infrared: ?[]const u8 = null,
     /// Unresampled capture, retained when the scanner used rectangular pixels.
     native_scan: ?[]const u8 = null,
+    native_infrared: ?[]const u8 = null,
     capture_dpi: ?[2]f32 = null,
-    /// Uncorrected RGB capture and the infrared plane used for its working copy.
+    /// Legacy V600 SDK originals and precomputed corrections, kept reversible.
     original_scan: ?[]const u8 = null,
     infrared_scan: ?[]const u8 = null,
     infrared_corrected: bool = true,
@@ -418,14 +421,15 @@ pub const Roll = struct {
     /// Adds the scan in `bytes` (a binary PNM) the way `addImage` does, and returns the index of
     /// its first frame.
     pub fn addScan(roll: *Roll, gpa: std.mem.Allocator, io: Io, bytes: []const u8) !usize {
-        return roll.addScanAt(gpa, io, bytes, null);
+        return roll.addScanAt(gpa, io, bytes, null, null);
     }
 
-    /// Like `addScan`, for a scan made at `dpi` pixels per inch, which frame detection needs.
-    pub fn addScanAt(roll: *Roll, gpa: std.mem.Allocator, io: Io, bytes: []const u8, dpi: ?f32) !usize {
+    /// Like `addScan`, for a scan made at `dpi` pixels per inch, which frame detection needs, and
+    /// with its infrared pass, if the scanner made one.
+    pub fn addScanAt(roll: *Roll, gpa: std.mem.Allocator, io: Io, bytes: []const u8, dpi: ?f32, infrared_plane: ?image.Plane) !usize {
         var scan = try pnm.read(gpa, bytes);
         defer scan.deinit(gpa);
-        return (try roll.addImage(gpa, io, scan, dpi)).first;
+        return (try roll.addImageWith(gpa, io, scan, .{ .dpi = dpi, .infrared = infrared_plane })).first;
     }
 
     /// What a new scan brings besides its pixels.
@@ -559,7 +563,7 @@ pub const Roll = struct {
             .height = scan.height,
             .dpi = dpi,
             .infrared = plane_name,
-            .settings = .{ .kind = roll.info.kind, .slide_colour = extras.slide },
+            .settings = .{ .kind = roll.info.kind, .slide_colour = extras.slide, .dust = .{ .finder = roll.dustFinder(plane_name != null) } },
         };
         if (found.len == 0) try roll.appendFrame(frame);
         for (found) |f| {
@@ -570,6 +574,14 @@ pub const Roll = struct {
         }
         for (first..roll.frames.items.len) |index| try roll.saveFrame(io, index);
         return .{ .first = first, .count = roll.frames.items.len - first };
+    }
+
+    /// How a new frame's dust is found: with infrared when its scan has a plane and the roll's
+    /// stock isn't one infrared fails on, and by its shape otherwise.
+    fn dustFinder(roll: *const Roll, has_plane: bool) dust.Finder {
+        if (!has_plane) return .shape;
+        const stock = stocks.named(roll.info.stock orelse "") orelse return .infrared;
+        return if (stock.infraredFit() == .unsuitable) .shape else .infrared;
     }
 
     /// Picks a name for the next scan file, with `extension`: numbered like the next frame, unless
@@ -768,7 +780,7 @@ test "infrared sidecars retain the original and the selected copy survives reope
     @memset(raw.pixels, .{ 1000, 30000, 60000 });
     const ppm = try pnm.write(gpa, u16, raw);
     defer gpa.free(ppm);
-    const index = try rl.addScanAt(gpa, io, ppm, 800);
+    const index = try rl.addScanAt(gpa, io, ppm, 800, null);
     const original_path = try rl.scanPath(gpa, index);
     defer gpa.free(original_path);
     @memset(raw.pixels, .{ 1234, 34567, 54321 });
@@ -1362,7 +1374,7 @@ test "a refused infrared correction stores its plane and retains the original fr
     @memset(raw.pixels, .{ 1000, 30000, 60000 });
     const ppm = try pnm.write(gpa, u16, raw);
     defer gpa.free(ppm);
-    const index = try r.addScanAt(gpa, io, ppm, 800);
+    const index = try r.addScanAt(gpa, io, ppm, 800, null);
     const original = r.frames.items[index].scan.?;
     var ir = try image.Gray.init(gpa, 16, 16);
     defer ir.deinit(gpa);

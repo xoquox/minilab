@@ -88,6 +88,9 @@ pub const Messages = struct {
     positive_film: [:0]const u8 = "Positive Film",
 
     resolution: [:0]const u8 = "Resolution",
+    // A check box for scanners that can scan in infrared too: a second pass that finds dust.
+    infrared_pass: [:0]const u8 = "Infrared pass",
+    infrared_pass_help: [:0]const u8 = "For infrared dust removal · each frame takes about twice as long",
     native_resolution: [:0]const u8 = "Native X / Y resolution",
     native_archive_note: [:0]const u8 = "Native TIFF kept; square-pixel working copy at {0} dpi",
     native_save_failed: [:0]const u8 = "Native TIFF could not be saved; working scan kept",

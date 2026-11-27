@@ -307,13 +307,14 @@ fn scanCommand(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !
     const setup = if (capabilities.profile) |p| p.summary else if (capabilities.options) |o| scan.rawSetup(o.items, &.{}).report.label(&raw_buffer) else "no profile: the data may not be linear";
     std.log.info("{s} {s}: {t}, {d} dpi, {s}", .{ device.vendor, device.model, capabilities.source, resolution, setup });
     var progress: scan.Progress = .{};
-    var image = try scanner.scan(gpa, .{ .source = capabilities.source, .film = film, .dpi = resolution, .dpi_y = dpi_y, .area = if (infrared) area orelse capabilities.area else area, .infrared = infrared }, &progress);
+    var image = try scanner.scan(gpa, .{ .source = capabilities.source, .film = film, .dpi = resolution, .dpi_y = dpi_y, .area = if (infrared) area orelse capabilities.area else area, .infrared = infrared, .sdk_infrared = infrared and capabilities.sdk_infrared }, &progress);
     defer image.deinit(gpa);
     const is_tiff = std.mem.endsWith(u8, output.?, ".tiff") or std.mem.endsWith(u8, output.?, ".tif");
     if (image.dpi[0] != image.dpi[1] and !is_tiff) return error.Usage;
     var corrected: ?minilab.image.Scan = null;
     defer if (corrected) |*s| s.deinit(gpa);
-    if (image.infrared) |ir| {
+    if (image.infrared) |ir_plane| {
+        const ir: minilab.image.Gray = .{ .width = ir_plane.width, .height = ir_plane.height, .pixels = @as([*]u16, @ptrCast(ir_plane.pixels.ptr))[0..ir_plane.pixels.len] };
         const original = try minilab.roll.encodeRawAxes(gpa, image.scan, image.dpi[0], image.dpi[1]);
         defer gpa.free(original);
         const original_path = try std.fmt.allocPrint(gpa, "{s}.original.tiff", .{output.?});
