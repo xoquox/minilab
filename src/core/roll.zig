@@ -27,6 +27,7 @@ const stats = @import("stats.zig");
 const develop = @import("develop.zig");
 const look = @import("look.zig");
 const date = @import("date.zig");
+const json_file = @import("json_file.zig");
 const Date = date.Date;
 const pnm = @import("../io/pnm.zig");
 const tiff = @import("../io/codecs/tiff.zig");
@@ -299,6 +300,22 @@ pub const Roll = struct {
         const a = temporary.allocator();
         const bytes = try std.json.Stringify.valueAlloc(a, roll.info, json_options);
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ roll.path, info_file }), .data = bytes });
+    }
+
+    /// Changes the displayed name without moving the folder or invalidating open paths.
+    /// Publish the new in-memory value only after replacing roll.json successfully.
+    pub fn setName(roll: *Roll, io: Io, value: []const u8) !void {
+        const name = std.mem.trim(u8, value, " \t\r\n");
+        if (!validName(name) or std.mem.indexOfAny(u8, name, "\x00\r\n") != null or !std.unicode.utf8ValidateSlice(name)) return error.BadRollName;
+        if (std.mem.eql(u8, roll.info.name, name)) return;
+        const arena = roll.arena.allocator();
+        var next = roll.info;
+        next.name = try arena.dupe(u8, name);
+        var temporary = roll.scratch();
+        defer temporary.deinit();
+        const at = try std.fs.path.join(temporary.allocator(), &.{ roll.path, info_file });
+        try json_file.write(roll.arena.child_allocator, io, at, next);
+        roll.info.name = next.name;
     }
 
     /// One of the roll's editable details, or null when it isn't set.
@@ -1389,4 +1406,77 @@ test "a refused infrared correction stores its plane and retains the original fr
     var thumb = try r.frameThumbnail(gpa, io, index);
     defer thumb.deinit(gpa);
     try std.testing.expectEqual(raw.pixels[0], thumb.pixels[0]);
+}
+
+test "renaming preserves the folder, frames, scan pixels and unknown metadata" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var r = try testRoll(&tmp, .{ .name = "Original", .camera = "Nikon F3", .notes = "Keep these notes" });
+    defer r.close();
+    const original_path = try gpa.dupe(u8, r.path);
+    defer gpa.free(original_path);
+    var scan = try image.Scan.init(gpa, 4, 3);
+    defer scan.deinit(gpa);
+    @memset(scan.pixels, .{ 1000, 2000, 3000 });
+    const ppm = try pnm.write(gpa, u16, scan);
+    defer gpa.free(ppm);
+    const index = try r.addScanAt(gpa, io, ppm, 800, null);
+    r.frames.items[index].crop = .{ .x = 1, .y = 0, .width = 2, .height = 3 };
+    r.frames.items[index].quarter_turns = 1;
+    r.frames.items[index].settings.saturation = 1.23;
+    try r.saveFrame(io, index);
+    const frame_before = r.frames.items[index];
+    const info_path = try std.fs.path.join(gpa, &.{ r.path, info_file });
+    defer gpa.free(info_path);
+    try json_file.write(gpa, io, info_path, .{ .name = r.info.name, .future_rename_test = @as(u32, 42) });
+    try r.setName(io, "  Film Jörg 2026  ");
+    try std.testing.expectEqualStrings("Film Jörg 2026", r.info.name);
+    try std.testing.expectEqualStrings(original_path, r.path);
+    try std.testing.expectEqualDeep(frame_before, r.frames.items[index]);
+    var reopened = try Roll.open(gpa, io, original_path);
+    defer reopened.close();
+    try std.testing.expectEqualStrings("Film Jörg 2026", reopened.info.name);
+    try std.testing.expectEqualStrings("Nikon F3", reopened.info.camera.?);
+    try std.testing.expectEqualStrings("Keep these notes", reopened.info.notes.?);
+    try std.testing.expectEqualDeep(frame_before, reopened.frames.items[index]);
+    var raw = try keptScan(&reopened, index);
+    defer raw.deinit(gpa);
+    try std.testing.expectEqualSlices([3]u16, scan.pixels, raw.pixels);
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, info_path, gpa, .limited(max_json_bytes));
+    defer gpa.free(bytes);
+    const extra = try std.json.parseFromSlice(struct { future_rename_test: u32 }, gpa, bytes, .{ .ignore_unknown_fields = true });
+    defer extra.deinit();
+    try std.testing.expectEqual(@as(u32, 42), extra.value.future_rename_test);
+}
+
+test "invalid or failed renames preserve the old name and roll.json" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var r = try testRoll(&tmp, .{ .name = "Original" });
+    defer r.close();
+    for ([_][]const u8{ "", " \t", ".", "..", "a/b", "a\\b", "a:b", "a\nb", "a\x00b", "\xff" }) |invalid| {
+        try std.testing.expectError(error.BadRollName, r.setName(io, invalid));
+    }
+    const at = try std.fs.path.join(gpa, &.{ r.path, info_file });
+    defer gpa.free(at);
+    const before = try Io.Dir.cwd().readFileAlloc(io, at, gpa, .limited(max_json_bytes));
+    defer gpa.free(before);
+    const blocked = try std.fmt.allocPrint(gpa, "{s}.partial", .{at});
+    defer gpa.free(blocked);
+    try Io.Dir.cwd().createDir(io, blocked, .default_dir);
+    // A no-op does not need a writable metadata file.
+    try r.setName(io, "Original");
+    var failed = false;
+    r.setName(io, "New name") catch {
+        failed = true;
+    };
+    try std.testing.expect(failed);
+    try std.testing.expectEqualStrings("Original", r.info.name);
+    const after = try Io.Dir.cwd().readFileAlloc(io, at, gpa, .limited(max_json_bytes));
+    defer gpa.free(after);
+    try std.testing.expectEqualStrings(before, after);
 }
